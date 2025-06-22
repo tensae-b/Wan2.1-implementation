@@ -342,6 +342,8 @@ class Head(nn.Module):
         """
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
+            e = e.to(self.modulation.device)
+            x= x.to(e.device)
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x

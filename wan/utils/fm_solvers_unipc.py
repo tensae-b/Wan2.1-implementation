@@ -319,7 +319,19 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         if self.predict_x0:
             if self.config.prediction_type == "flow_prediction":
+                
                 sigma_t = self.sigmas[self.step_index]
+                import logging
+                logging.info(f"[DeviceCheck] sample: shape={sample.shape}, device={sample.device}, dtype={sample.dtype}")
+                logging.info(f"[DeviceCheck] model_output: shape={model_output.shape}, device={model_output.device}, dtype={model_output.dtype}")
+                logging.info(f"[DeviceCheck] sigma_t: type={type(sigma_t)} value={sigma_t}")
+
+                if not torch.is_tensor(sigma_t):
+                    sigma_t = torch.tensor(sigma_t, device=sample.device, dtype=sample.dtype)
+                else:
+                    sigma_t = sigma_t.to(device=sample.device, dtype=sample.dtype)
+                    
+                model_output=model_output.to(sample.device)
                 x0_pred = sample - sigma_t * model_output
             else:
                 raise ValueError(
