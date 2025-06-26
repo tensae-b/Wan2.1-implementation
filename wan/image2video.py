@@ -1087,7 +1087,9 @@ class WanI2V:
             model = self.model
         else:
             model = self.get_model_for_device(device_id)
-        
+        # sample_solver= 'dpm++'
+        sampling_steps= 20
+        print(sampling_steps, sample_solver, 'here are the steps')
         try:
             with amp.autocast(dtype=self.param_dtype), torch.no_grad():
                 # FIXED: Use the EXACT same scheduler setup as the working generate_segment
@@ -1169,8 +1171,10 @@ class WanI2V:
                 max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
                 
                 print(f"Max sequence length: {max_seq_len}")
-                
+                print(f"Timestep range: {timesteps[0]} → {timesteps[-1]}")
                 # Main sampling loop
+                inital=current_latent
+                print(f"Starting noise: {inital.std():.4f}")
                 for step_idx, t in enumerate(timesteps):
                     print(f"\n=== Step {step_idx + 1}/{len(timesteps)}, timestep: {t} ===")
                     
@@ -1303,9 +1307,12 @@ class WanI2V:
                     # Memory cleanup
                     if step_idx % 5 == 0:
                         torch.cuda.empty_cache()
+                        
+                  
                     print("=== TESTING: Breaking after first timestep ===")
                     break
-                
+                print(f"Final noise: {current_latent.std():.4f}")
+                print(f"Noise reduction: {(current_latent.std() - inital.std()):.4f}")
                 print(f"Final latent shape: {current_latent.shape}")
                 return current_latent
                 
@@ -1437,14 +1444,14 @@ class WanI2V:
         max_area=int(480 * 832 * 0.7),
        
                                         total_frames=4,
-                                        latent_window_size=2,
+                                        latent_window_size=1,
                                         frame_num=None,  # For compatibility
                                         total_duration_seconds=None,
                                         fps=30,
-                                        shift=3.0,
-                                        sample_solver='dpm++',
+                                        shift=1,
+                                        sample_solver='unipc',
                                         sampling_steps=20,
-                                        guide_scale=3.5,
+                                        guide_scale=7.5,
                                         n_prompt="",
                                         seed=-1,
                                         offload_model=False,
