@@ -272,8 +272,7 @@ def generate(args):
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
-        logging.info(
-            f"offload_model is not specified, set to {args.offload_model}.")
+         
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -322,8 +321,6 @@ def generate(args):
     if args.ulysses_size > 1:
         assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
 
-    logging.info(f"Generation job args: {args}")
-    logging.info(f"Generation model config: {cfg}")
 
     if dist.is_initialized():
         base_seed = [args.base_seed] if rank == 0 else [None]
@@ -333,18 +330,14 @@ def generate(args):
     if "t2v" in args.task or "t2i" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
-        logging.info(f"Input prompt: {args.prompt}")
         if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
             if rank == 0:
                 prompt_output = prompt_expander(
                     args.prompt,
                     tar_lang=args.prompt_extend_target_lang,
                     seed=args.base_seed)
                 if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
+                       
                     input_prompt = args.prompt
                 else:
                     input_prompt = prompt_output.prompt
@@ -354,9 +347,7 @@ def generate(args):
             if dist.is_initialized():
                 dist.broadcast_object_list(input_prompt, src=0)
             args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
 
-        logging.info("Creating WanT2V pipeline.")
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -368,8 +359,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
         )
 
-        logging.info(
-            f"Generating {'image' if 't2i' in args.task else 'video'} ...")
+          
         video = wan_t2v.generate(
             args.prompt,
             size=SIZE_CONFIGS[args.size],
@@ -386,12 +376,9 @@ def generate(args):
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
         if args.image is None:
             args.image = EXAMPLE_PROMPT[args.task]["image"]
-        logging.info(f"Input prompt: {args.prompt}")
-        logging.info(f"Input image: {args.image}")
 
         img = Image.open(args.image).convert("RGB")
         if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
             if rank == 0:
                 prompt_output = prompt_expander(
                     args.prompt,
@@ -399,9 +386,7 @@ def generate(args):
                     image=img,
                     seed=args.base_seed)
                 if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
+                      
                     input_prompt = args.prompt
                 else:
                     input_prompt = prompt_output.prompt
@@ -411,9 +396,7 @@ def generate(args):
             if dist.is_initialized():
                 dist.broadcast_object_list(input_prompt, src=0)
             args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
 
-        logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -429,7 +412,6 @@ def generate(args):
             # offload_model=True 
         )
 
-        logging.info("Generating video ...")
         video = wan_i2v.generate(
             args.prompt,
             img,
@@ -448,13 +430,9 @@ def generate(args):
         if args.first_frame is None or args.last_frame is None:
             args.first_frame = EXAMPLE_PROMPT[args.task]["first_frame"]
             args.last_frame = EXAMPLE_PROMPT[args.task]["last_frame"]
-        logging.info(f"Input prompt: {args.prompt}")
-        logging.info(f"Input first frame: {args.first_frame}")
-        logging.info(f"Input last frame: {args.last_frame}")
         first_frame = Image.open(args.first_frame).convert("RGB")
         last_frame = Image.open(args.last_frame).convert("RGB")
         if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
             if rank == 0:
                 prompt_output = prompt_expander(
                     args.prompt,
@@ -462,9 +440,7 @@ def generate(args):
                     image=[first_frame, last_frame],
                     seed=args.base_seed)
                 if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
+                     
                     input_prompt = args.prompt
                 else:
                     input_prompt = prompt_output.prompt
@@ -474,9 +450,7 @@ def generate(args):
             if dist.is_initialized():
                 dist.broadcast_object_list(input_prompt, src=0)
             args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
 
-        logging.info("Creating WanFLF2V pipeline.")
         wan_flf2v = wan.WanFLF2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -488,7 +462,6 @@ def generate(args):
             t5_cpu=args.t5_cpu,
         )
 
-        logging.info("Generating video ...")
         video = wan_flf2v.generate(
             args.prompt,
             first_frame,
@@ -509,22 +482,17 @@ def generate(args):
             args.src_ref_images = EXAMPLE_PROMPT[args.task].get(
                 "src_ref_images", None)
 
-        logging.info(f"Input prompt: {args.prompt}")
         if args.use_prompt_extend and args.use_prompt_extend != 'plain':
-            logging.info("Extending prompt ...")
             if rank == 0:
                 prompt = prompt_expander.forward(args.prompt)
-                logging.info(
-                    f"Prompt extended from '{args.prompt}' to '{prompt}'")
+                  
                 input_prompt = [prompt]
             else:
                 input_prompt = [None]
             if dist.is_initialized():
                 dist.broadcast_object_list(input_prompt, src=0)
             args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
 
-        logging.info("Creating VACE pipeline.")
         wan_vace = wan.WanVace(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -542,7 +510,6 @@ def generate(args):
                 args.src_ref_images.split(',')
             ], args.frame_num, SIZE_CONFIGS[args.size], device)
 
-        logging.info(f"Generating video...")
         video = wan_vace.generate(
             args.prompt,
             src_video,
@@ -568,7 +535,6 @@ def generate(args):
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
 
         if "t2i" in args.task:
-            logging.info(f"Saving generated image to {args.save_file}")
             cache_image(
                 tensor=video.squeeze(1)[None],
                 save_file=args.save_file,
@@ -576,7 +542,6 @@ def generate(args):
                 normalize=True,
                 value_range=(-1, 1))
         else:
-            logging.info(f"Saving generated video to {args.save_file}")
             cache_video(
                 tensor=video[None],
                 save_file=args.save_file,
@@ -584,7 +549,6 @@ def generate(args):
                 nrow=1,
                 normalize=True,
                 value_range=(-1, 1))
-    logging.info("Finished.")
 
 
 if __name__ == "__main__":

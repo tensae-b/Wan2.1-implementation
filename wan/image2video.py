@@ -85,7 +85,18 @@ class ModelParallelWrapper(nn.Module):
             rope_params(1024, 2 * (d // 6)),
             rope_params(1024, 2 * (d // 6))
         ], dim=1))
-        
+        if hasattr(model, 'config'):
+            logging.info(f"Model config: {model.config}")
+            logging.info(f"Model : {model}")
+            if hasattr(model.config, 'prediction_type'):
+               
+                logging.info(f"Model config prediction_type: {model.config.prediction_type}")
+            if hasattr(model.config, 'parameterization'):
+                logging.info(f"Model parameterization: {model.config.parameterization}")
+            
+            # Check if model has any hints in its architecture
+        if hasattr(model, 'prediction_type'):
+                logging.info(f"Model prediction_type attribute: {model.prediction_type}")
         # Get blocks from original model
         if hasattr(model, 'blocks'):
             self.blocks = model.blocks
@@ -102,7 +113,6 @@ class ModelParallelWrapper(nn.Module):
         else:
             self._setup_default_strategy(model)
         
-        logging.info(f"Model parallel setup complete with {self.num_devices} GPUs")
         # self._log_gpu_distribution()
     def clear_intermediate_gpu_memory(self):
         """Clear memory on intermediate GPUs to prepare for next timestep"""
@@ -136,12 +146,12 @@ class ModelParallelWrapper(nn.Module):
     
     def _distribute_blocks_properly(self):
         """Properly distribute blocks with all parameters"""
+        
         for device_idx, block_indices in enumerate(self.device_blocks):
             if not block_indices:
                 continue
                 
             device = self.devices[device_idx]
-            logging.info(f"Moving blocks {block_indices[0]}-{block_indices[-1]} to {device}")
             
             for idx in block_indices:
                 # Move entire block
@@ -210,6 +220,12 @@ class ModelParallelWrapper(nn.Module):
         
         torch.cuda.synchronize(device0)  # Synchronize after input processing
         
+
+        # Check time embedding layers
+        
+            
+            
+        
         # 3. Use pre-initialized patch embedding (not create new one!)
         x = [self.patch_embedding(u.to(torch.bfloat16)) for u in x]
         
@@ -229,6 +245,7 @@ class ModelParallelWrapper(nn.Module):
         with torch.cuda.amp.autocast(dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            
         # with torch.cuda.amp.autocast(dtype=torch.float32):
         #     e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
         #     e_proj = self.time_projection(e)
@@ -274,7 +291,6 @@ class ModelParallelWrapper(nn.Module):
                 continue
                 
             device = self.devices[device_idx]
-            logging.info(f"[Forward] Processing blocks on device {device} ({len(block_indices)} blocks)")
             
             # Move tensors with BLOCKING transfers and proper sync
             if device != current_device:
@@ -305,7 +321,6 @@ class ModelParallelWrapper(nn.Module):
                 
                 x = self.blocks[block_idx](x, **kwargs)
             
-            logging.info(f"[Forward] Completed device {device}, x shape: {x.shape}")
         
         # final_device = x.device
         # head_device = next(self.head.parameters()).device
@@ -316,8 +331,7 @@ class ModelParallelWrapper(nn.Module):
         # e_head = e_head.to(final_device, non_blocking=False)
         
         # x = self.head(x, e_head)
-        print(f"Head input shapes: x={x.shape}, e_head={e.shape}")
-        print(f"Head modulation shape: {self.head.modulation.shape}")
+        
         e = e.to(x.device, non_blocking=False)
         
         x = self.head(x, e)
@@ -384,8 +398,6 @@ class FramePackingSampler:
         clean_latents_pre = start_latent.to(history_latents.device).to(history_latents.dtype)
         
         # Verify dimensions before concatenation
-        logging.info(f"clean_latents_pre shape: {clean_latents_pre.shape}")
-        logging.info(f"clean_latents_post shape: {clean_latents_post.shape}")
         
         # Combine start and post latents
         clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
@@ -408,6 +420,7 @@ class FramePackingSampler:
             dtype=history_latents.dtype,
             device=history_latents.device
         )
+       
         
         # Pack all components
         packed_components = [clean_latents_pre]
@@ -493,12 +506,10 @@ class EnhancedGPUResourceManager:
     
     def log_memory_status(self, prefix=""):
         """Log current memory status of all GPUs"""
-        logging.info(f"{prefix} GPU Memory Status:")
         for i in range(torch.cuda.device_count()):
             total_mem = torch.cuda.get_device_properties(i).total_memory / 1e9
             used_mem = (torch.cuda.memory_allocated(i) + torch.cuda.memory_reserved(i)) / 1e9
             free_mem = self.available_memory.get(i, 0) / 1e9
-            logging.info(f"  GPU {i}: {used_mem:.2f}/{total_mem:.2f} GB used, {free_mem:.2f} GB free")
 
 
 class WanI2V:
@@ -539,8 +550,6 @@ class WanI2V:
         # self.param_dtype = config.param_dtype
         self.param_dtype=torch.bfloat16 
         # Log initial setup
-        logging.info(f"Initializing WanI2V with {torch.cuda.device_count()} GPUs available")
-        logging.info(f"Model parallel: {self.model_parallel}, Strategy: {parallel_strategy}")
         
         # Initialize components
         self._initialize_components(checkpoint_dir, device_id, t5_fsdp, dit_fsdp, init_on_cpu)
@@ -552,7 +561,6 @@ class WanI2V:
         shard_fn = partial(shard_model, device_id=device_id)
         
         # Initialize T5 text encoder - always on CPU initially to save GPU memory
-        print('--------------loading encoder to gpu------------')
         self.text_encoder = T5EncoderModel(
             text_len=self.config.text_len,
             dtype=self.config.t5_dtype,
@@ -594,12 +602,10 @@ class WanI2V:
         )
         
         # Initialize main model
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
         
         # Apply model parallelism if enabled
         if self.model_parallel:
             devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
-            logging.info(f"Enabling model parallelism across {len(devices)} GPUs with strategy: {self.parallel_strategy}")
             
             # Load model with CPU first to avoid OOM
             with torch.device('cpu'):
@@ -607,7 +613,7 @@ class WanI2V:
                 self.model.eval().requires_grad_(False)
                 # Convert to appropriate dtype on CPU
                 self.model = self.model.to(dtype=self.param_dtype)
-            
+            self.model.eval().requires_grad_(False)
             # Now wrap with model parallelism which will distribute blocks to GPUs
             self.model = ModelParallelWrapper(
                 self.model, 
@@ -615,6 +621,28 @@ class WanI2V:
                 vae=self.vae,
                 strategy=self.parallel_strategy
             )
+            
+            
+            # Look for clues in model class name or modules
+            logging.info(f"Model class: {type(self.model).__name__}")
+            self.model.eval()
+            self.model.requires_grad_(False)
+
+            # Also force eval mode on all individual blocks
+            if hasattr(self.model, 'blocks'):
+                for block in self.model.blocks:
+                    block.eval()
+                    block.requires_grad_(False)
+
+            # Force eval mode on all components
+            if hasattr(self.model, 'patch_embedding'):
+                self.model.patch_embedding.eval()
+            if hasattr(self.model, 'time_embedding'):
+                self.model.time_embedding.eval()
+            if hasattr(self.model, 'text_embedding'):
+                self.model.text_embedding.eval()
+            if hasattr(self.model, 'head'):
+                self.model.head.eval()
             
             # Update VAE device if set by wrapper
             if hasattr(self.model, 'vae_device'):
@@ -624,7 +652,6 @@ class WanI2V:
                 # If VAE has a model attribute, move that
                 if hasattr(self.vae, 'model'):
                     self.vae.model = self.vae.model.to(self.model.vae_device)
-                logging.info(f"VAE assigned to {self.model.vae_device}")
         else:
             # Standard model loading
             if init_on_cpu:
@@ -647,7 +674,6 @@ class WanI2V:
         # Initialize model copies for data parallelism (if not using model parallelism)
         if self.multi_gpu and not self.model_parallel:
             self.num_gpus = torch.cuda.device_count()
-            logging.info(f"Data parallel mode with {self.num_gpus} GPUs")
             self.models = {}
         else:
             self.models = None
@@ -664,7 +690,6 @@ class WanI2V:
             # Create a copy of the model for this device
             device = torch.device(f"cuda:{device_id}")
             self.models[device_id] = copy.deepcopy(self.model).to(device)
-            logging.info(f"Created model copy for GPU {device_id}")
         
         return self.models[device_id]
 
@@ -806,7 +831,6 @@ class WanI2V:
         all_latents = []
         
         for seg_idx in range(num_segments):
-            logging.info(f"Generating segment {seg_idx + 1}/{num_segments}")
             
             # Prepare mask
             msk = torch.ones(1, segment_frames, lat_h, lat_w, device=self.device)
@@ -894,7 +918,6 @@ class WanI2V:
         """Enhanced parallel generation with better resource management"""
         
         num_gpus = torch.cuda.device_count()
-        logging.info(f"Parallel generation across {num_gpus} GPUs")
         
         if self.gpu_manager:
             self.gpu_manager.log_memory_status("Before generation")
@@ -988,7 +1011,6 @@ class WanI2V:
             # Without model parallelism, be conservative
             max_parallel = min(num_gpus, 2)
         
-        logging.info(f"Processing segments with max {max_parallel} parallel generations")
         
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             # Process in batches to avoid OOM
@@ -1037,7 +1059,6 @@ class WanI2V:
                             # Remove overlap frames
                             all_latents[seg_idx] = latent[:, overlap_frames // 4:]
                         
-                        logging.info(f"Completed segment {seg_idx + 1}/{num_segments}")
                         
                     except Exception as e:
                         logging.error(f"Error processing segment {seg_idx}: {str(e)}")
@@ -1087,19 +1108,21 @@ class WanI2V:
             model = self.model
         else:
             model = self.get_model_for_device(device_id)
-        # sample_solver= 'dpm++'
+        sample_solver= 'dpm++'
         sampling_steps= 20
-        print(sampling_steps, sample_solver, 'here are the steps')
+        guide_scale=1.5
         try:
             with amp.autocast(dtype=self.param_dtype), torch.no_grad():
                 # FIXED: Use the EXACT same scheduler setup as the working generate_segment
-                print(f"Setting up scheduler: {sample_solver}, steps: {sampling_steps}")
                 
                 if sample_solver == 'unipc':
+                    from diffusers import UniPCMultistepScheduler 
                     sample_scheduler = FlowUniPCMultistepScheduler(
-                        num_train_timesteps=self.num_train_timesteps,
-                        shift=1,  # Use 1 like in working version
-                        use_dynamic_shifting=False
+                       num_train_timesteps=1000,
+                        beta_start=0.0001,
+                        beta_end=0.02,
+                        beta_schedule="linear"
+
                     )
                     sample_scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
                     timesteps = sample_scheduler.timesteps
@@ -1119,12 +1142,9 @@ class WanI2V:
                 else:
                     raise NotImplementedError(f"Unsupported solver: {sample_solver}")
                 
-                print(f"Scheduler setup complete. Timesteps: {len(timesteps)}")
-                print(f"First few timesteps: {timesteps[:5] if len(timesteps) > 5 else timesteps}")
                 
                 # Validate timesteps
                 if len(timesteps) != sampling_steps:
-                    print(f"WARNING: Expected {sampling_steps} timesteps, got {len(timesteps)}")
                     if len(timesteps) == 0:
                         raise ValueError("Scheduler generated no timesteps")
                 
@@ -1142,41 +1162,32 @@ class WanI2V:
                 current_latent = packed_latents[:, :, mask_start:mask_end, :, :].clone()
                 
                 # CRITICAL FIX: Ensure current_latent always has 5 dimensions
-                print(f"Before fix - current_latent shape: {current_latent.shape}")
-                print(f"packed_latents shape: {packed_latents.shape}")
-                print(f"Extracting frames {mask_start}:{mask_end}")
                 
                 if current_latent.dim() == 4:
                     # This happens when mask_start:mask_end gives only 1 frame
                     # Add the batch dimension back
                     current_latent = current_latent.unsqueeze(0)
-                    print(f"Added batch dimension: {current_latent.shape}")
                 elif current_latent.dim() == 3:
                     # This happens if the frame dimension collapses
                     # Reshape to [B, C, T, H, W] format
                     current_latent = current_latent.unsqueeze(0).unsqueeze(2)
-                    print(f"Reshaped to 5D: {current_latent.shape}")
                 
                 # Ensure minimum temporal dimension
                 if current_latent.shape[2] == 0:
                     # If no frames extracted, create a single frame
                     current_latent = packed_latents[:, :, mask_start:mask_start+1, :, :].clone()
-                    print(f"Created single frame: {current_latent.shape}")
                 
-                print(f"Final current_latent shape: {current_latent.shape}")
                 
                 # Calculate max sequence length for the full packed input
                 max_seq_len = packed_latents.shape[2] * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
                 self.sp_size = getattr(self, 'sp_size', 64)
                 max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
                 
-                print(f"Max sequence length: {max_seq_len}")
-                print(f"Timestep range: {timesteps[0]} → {timesteps[-1]}")
                 # Main sampling loop
                 inital=current_latent
-                print(f"Starting noise: {inital.std():.4f}")
+                logging.info(f"Input latent shape: {current_latent.shape}")
+                logging.info(f"Input latent stats: mean={current_latent.mean():.4f}, std={current_latent.std():.4f}")
                 for step_idx, t in enumerate(timesteps):
-                    print(f"\n=== Step {step_idx + 1}/{len(timesteps)}, timestep: {t} ===")
                     
                     if progress_callback:
                         progress_callback({'step': step_idx + 1, 'total_steps': len(timesteps)})
@@ -1185,8 +1196,6 @@ class WanI2V:
                     packed_input = packed_latents.clone()
                     packed_input[:, :, mask_start:mask_end, :, :] = current_latent
                     
-                    print(f"Step {step_idx}: current_latent shape: {current_latent.shape}")
-                    print(f"Step {step_idx}: packed_input shape: {packed_input.shape}")
                     
                     # Ensure timestep is properly formatted
                     if isinstance(t, torch.Tensor):
@@ -1208,6 +1217,7 @@ class WanI2V:
                         'y': [y]
                     }
                     
+                   
                     # SIMPLIFIED: Use the same model call pattern as working version
                     with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
                         # Prepare model input in the same format as working version
@@ -1218,11 +1228,14 @@ class WanI2V:
                         noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)
                         if isinstance(noise_pred_cond, list):
                             noise_pred_cond = noise_pred_cond[0]
-                        
-                        print(f"Raw model output shape: {noise_pred_cond.shape}")
-                        
+                            
                         # Process the output to get the right window
                         noise_pred_cond = self._extract_window_simple(noise_pred_cond, mask_start, mask_end, current_latent)
+                        
+                        logging.info(f"Noise pred cond shape: {noise_pred_cond.shape}")
+                        logging.info(f"Noise pred cond stats: mean={noise_pred_cond.mean():.4f}, std={noise_pred_cond.std():.4f}")
+
+                        
                         
                         # Process unconditional - same pattern
                         noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)
@@ -1233,21 +1246,17 @@ class WanI2V:
                         
                         # Guidance - same as working version
                         noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
-                        
+                    
                         # Clean up
-                        del noise_pred_cond, noise_pred_uncond, latent_model_input
+                       
                     
                     # Ensure current_latent and noise_pred have compatible shapes
                     if current_latent.shape != noise_pred.shape:
-                        print(f"Adjusting shapes: current_latent={current_latent.shape}, noise_pred={noise_pred.shape}")
                         current_latent = self._match_tensor_shapes(current_latent, noise_pred)
                     
-                    print(f"Before scheduler: current_latent={current_latent.shape}, noise_pred={noise_pred.shape}")
-                    print(f"Timestep value: {t}, type: {type(t)}")
                     
                     # FIXED: Handle scheduler dimensions correctly
                     try:
-                        print(f"Before scheduler: current_latent={current_latent.shape}, noise_pred={noise_pred.shape}")
                         
                         # Check if we need to add dimensions for scheduler
                         if current_latent.dim() == 5 and noise_pred.dim() == 5:
@@ -1287,19 +1296,22 @@ class WanI2V:
                                 generator=seed_g
                             )[0]
                             current_latent = temp_x0
-                        
-                        print(f"After scheduler: current_latent={current_latent.shape}")
+                        guidance_effect = (noise_pred - noise_pred_uncond).abs().mean()
+                        logging.info(f"Guidance effect magnitude: {guidance_effect:.6f}")
+                        del noise_pred_cond, noise_pred_uncond, latent_model_input
+                        # Check if predictions are reasonable
+                        if noise_pred.std() < 0.01:
+                            logging.warning(f"Very low noise prediction variance: {noise_pred.std():.6f}")
+                        if noise_pred.std() > 100:
+                            logging.warning(f"Very high noise prediction variance: {noise_pred.std():.6f}")
+                            
+                        logging.warning(f"current variance: {current_latent.std():.6f}")
                         
                         # Ensure current_latent stays 5D
                         if current_latent.dim() == 4:
                             current_latent = current_latent.unsqueeze(0)
-                            print(f"Fixed to 5D: {current_latent.shape}")
                         
                     except Exception as scheduler_error:
-                        print(f"Scheduler error: {scheduler_error}")
-                        print(f"Timestep: {t}, type: {type(t)}")
-                        print(f"noise_pred shape: {noise_pred.shape}")
-                        print(f"current_latent shape: {current_latent.shape}")
                         raise
                     
                     del noise_pred
@@ -1307,13 +1319,10 @@ class WanI2V:
                     # Memory cleanup
                     if step_idx % 5 == 0:
                         torch.cuda.empty_cache()
-                        
+                    if step_idx==3:
+                        break
                   
-                    print("=== TESTING: Breaking after first timestep ===")
-                    break
-                print(f"Final noise: {current_latent.std():.4f}")
-                print(f"Noise reduction: {(current_latent.std() - inital.std()):.4f}")
-                print(f"Final latent shape: {current_latent.shape}")
+                logging.warning(f"inital variance: {inital.std():.6f}")
                 return current_latent
                 
         except Exception as e:
@@ -1325,7 +1334,6 @@ class WanI2V:
 
     def _process_model_output(self, model_output, target_latent, mask_start, mask_end, output_type):
         """Process model output to match target shape"""
-        print(f"Processing {output_type} output: {model_output.shape} -> target: {target_latent.shape}")
         
         # Handle 4D output (missing batch dimension)
         if model_output.dim() == 4:
@@ -1336,11 +1344,9 @@ class WanI2V:
             b, c, t, h, w = model_output.shape
             target_b, target_c, target_t, target_h, target_w = target_latent.shape
             
-            print(f"Model output frames: {t}, target frames: {target_t}")
             
             # Fix spatial dimensions first
             if h != target_h or w != target_w:
-                print(f"Resizing from ({h}, {w}) to ({target_h}, {target_w})")
                 model_output = model_output.view(b * c * t, 1, h, w)
                 model_output = torch.nn.functional.interpolate(
                     model_output, 
@@ -1357,11 +1363,9 @@ class WanI2V:
                 if t >= mask_end:
                     # Extract the specific frames we need
                     model_output = model_output[:, :, mask_start:mask_end, :, :]
-                    print(f"Extracted frames {mask_start}:{mask_end} from {t} total frames")
                 else:
                     # Take the last few frames if we don't have enough
                     model_output = model_output[:, :, -window_size:, :, :]
-                    print(f"Took last {window_size} frames from {t} total frames")
             
             elif t < target_t:
                 # Model predicted fewer frames - repeat or pad
@@ -1375,9 +1379,7 @@ class WanI2V:
                         model_output = torch.cat([repeated, extra], dim=2)
                     else:
                         model_output = repeated
-                    print(f"Repeated {t} frames to get {model_output.shape[2]} frames")
         
-        print(f"Final {output_type} shape: {model_output.shape}")
         return model_output
 
     def _extract_window_simple(self, model_output, mask_start, mask_end, target_latent):
@@ -1387,7 +1389,6 @@ class WanI2V:
         if model_output.dim() == 4:
             model_output = model_output.unsqueeze(0)
         
-        print(f"Extracting window {mask_start}:{mask_end} from output shape {model_output.shape}")
         
         # If output has the right number of dimensions, try direct extraction
         if model_output.dim() == 5:
@@ -1397,7 +1398,6 @@ class WanI2V:
             if target_latent.dim() == 4:
                 # Add batch dimension to target_latent
                 target_latent = target_latent.unsqueeze(0)
-                print(f"Added batch dimension to target_latent: {target_latent.shape}")
             
             if target_latent.dim() == 5:
                 target_b, target_c, target_t, target_h, target_w = target_latent.shape
@@ -1432,7 +1432,6 @@ class WanI2V:
                 needed_frames = mask_end - mask_start
                 extracted = model_output[:, :, -1:, :, :].repeat(1, 1, needed_frames, 1, 1)
             
-            print(f"Extracted shape: {extracted.shape}")
             return extracted
         
         else:
@@ -1452,7 +1451,7 @@ class WanI2V:
                                         sample_solver='unipc',
                                         sampling_steps=20,
                                         guide_scale=7.5,
-                                        n_prompt="",
+                                        n_prompt="low quality, blurry, static",
                                         seed=-1,
                                         offload_model=False,
                                         parallel_mode='sequential'):
@@ -1477,13 +1476,17 @@ class WanI2V:
         lat_w = w // self.vae_stride[2]
         
         # Encode prompts
-        logging.info("Encoding prompts...")
         self.text_encoder.model.to("cuda:3")
         context = self.text_encoder([input_prompt],device='cuda:3')
         context_null = self.text_encoder([n_prompt or self.sample_neg_prompt],device='cuda:3')
+        min_len = min(context[0].shape[0], context_null[0].shape[0])
+        context[0] = context[0][:min_len]
+        context_null[0] = context_null[0][:min_len]
+
+        ctx_diff = (context[0] - context_null[0]).abs().mean()
+        
         self.text_encoder.model.to("cpu")
         torch.cuda.empty_cache()
-        print('--------------offloading encoder to gpu------------')
         # Encode CLIP
         img = img.to(self.clip.device)
         clip_context = self.clip.visual([img[:, None, :, :]])
@@ -1495,6 +1498,7 @@ class WanI2V:
             img[None], size=(h, w), mode='bicubic'
         ).transpose(0, 1)
         img_resized= img_resized.to(self.vae.device)
+        
         start_latent = self.vae.encode([img_resized])[0]
         
         # Initialize frame packing
@@ -1506,7 +1510,6 @@ class WanI2V:
         frames_per_section = 4 # Each latent frame represents 4 video frames
         total_latent_sections = math.ceil(total_frames / frames_per_section)
         
-        logging.info(f"Generating {total_frames} frames in {total_latent_sections} sections")
         
         # Initialize history
         history_latents = torch.zeros(
@@ -1529,7 +1532,6 @@ class WanI2V:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
             
-            logging.info(f'Section {section_idx + 1}/{len(latent_paddings)}: padding={latent_padding_size}')
             
             # Pack latents
             if section_idx == 0:
@@ -1569,21 +1571,16 @@ class WanI2V:
                 seed_g=seed_g,
                 device_id=device.index,
                 offload_model=offload_model,
-                progress_callback=lambda info: logging.info(
-                    f"Section {section_idx+1}/{len(latent_paddings)}, "
-                    f"Step {info['step']}/{info['total_steps']}"
+                   
                 )
-            )
-            print(f"Generated shape: {generated.shape}")
+            
             if generated.dim() != 5:
-                print(f"Fixing dimensions from {generated.shape}")
                 # Remove extra dimensions
                 while generated.dim() > 5:
                     generated = generated.squeeze()
                 # Add missing dimensions  
                 while generated.dim() < 5:
                     generated = generated.unsqueeze(0)
-                print(f"Fixed to: {generated.shape}")
             # Store generated latents
             all_generated_latents.append(generated)
             
@@ -1607,29 +1604,30 @@ class WanI2V:
             torch.cuda.empty_cache()
         
         # Concatenate all latents
-        logging.info("Concatenating all generated latents...")
         final_latents = torch.cat(all_generated_latents, dim=2)
-        print(f"Concatenated latents...{final_latents.shape}" )
+        logging.info(f"=== TEST 15: FINAL OUTPUT VALIDATION ===")
+        logging.info(f"All generated latents count: {len(all_generated_latents)}")
+        for i, latent in enumerate(all_generated_latents):
+            logging.info(f"Section {i} latent shape: {latent.shape}")
+            logging.info(f"Section {i} stats: mean={latent.mean():.4f}, std={latent.std():.4f}")
         
         # Trim to exact frame count
         target_latent_frames = (total_frames - 1) // 4 + 1
         if final_latents.shape[2] > target_latent_frames:
             final_latents = final_latents[:, :, :target_latent_frames]
             
-        logging.info("Clearing GPU memory before VAE decoding...")
         for i in range(4):  # Your 4 GPUs
             with torch.cuda.device(f"cuda:{i}"):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-
+        
         # Wait for all operations to complete  
         torch.cuda.synchronize()
         # Decode video
-        logging.info("Decoding video...")
        # Move VAE to appropriate device if needed
         vae_device = getattr(self.vae, 'device', 'cuda:3')
         final_latents = final_latents.to(vae_device)
-
+        
         # Ensure VAE and its model are on the right device
         if hasattr(self.vae, 'model'):
             self.vae.model = self.vae.model.to(vae_device)
@@ -1643,7 +1641,6 @@ class WanI2V:
             # Convert single tensor to list format expected by decode method
             if final_latents.shape[0] == 1:
                 final_latents = final_latents.squeeze(0)
-                print(f"Squeezed for VAE: {final_latents.shape}")
             videos = self.vae.decode([final_latents])
 
         # Trim to exact frame count
