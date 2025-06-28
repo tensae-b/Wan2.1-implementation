@@ -509,12 +509,13 @@ class WanI2V:
         if True== True:
             print('here ')
             latent_window_size=3
-            self._generate_with_frame_packing(
+            result=self._generate_with_frame_packing(
                     noise, y, msk, context, context_null, clip_context,
                     lat_h, lat_w, F, shift, sample_solver, sampling_steps,
                     guide_scale, seed_g, max_seq_len, latent_window_size,
                     offload_model
                 )
+            return result
         # evaluation mode
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
 
@@ -704,7 +705,9 @@ class WanI2V:
             rnd = torch.Generator("cpu").manual_seed(seed_g)
         else:
             rnd = torch.Generator("cpu").manual_seed(seed_g.initial_seed() if hasattr(seed_g, 'initial_seed') else 42)
-        
+        fps = 24
+        duration_seconds = 2
+        F =3
         # Calculate total frames and sections
         num_frames = latent_window_size * 4 - 3  # Output frames per section
         total_latent_sections = max(1, (F + latent_window_size - 1) // latent_window_size)
@@ -795,6 +798,8 @@ class WanI2V:
                 total_generated_frames=total_generated_latent_frames
             )
             
+            print('result is here', result.shape)
+            
             if result is not None:
                 # Update history with newly generated frames
                 generated_frames = result[:, :, latent_padding_size:latent_padding_size+latent_window_size, :, :]
@@ -814,7 +819,7 @@ class WanI2V:
                     history_latents[:, :, 3:3+frames_for_4x, :, :] = generated_frames[:, :, -frames_for_4x:, :, :].cpu()
                 
                 total_generated_latent_frames += latent_window_size
-        
+        print('processed result is here')
         # Combine all generated latents
         if len(all_generated_latents) > 0:
             combined = torch.cat(all_generated_latents, dim=2)  # [1, 16, T, H, W]
@@ -831,238 +836,272 @@ class WanI2V:
 
 
     def generate_segment_with_frame_packing_history(self,
-                                                msk,
-                                                clean_latents,
-                                                clean_latents_2x,
-                                                clean_latents_4x,
-                                                clean_latent_indices,
-                                                clean_latent_2x_indices,
-                                                clean_latent_4x_indices,
-                                                blank_indices,
-                                                latent_indices,
-                                                context,
-                                                context_null,
-                                                clip_context,
-                                                latent_window_size,
-                                                latent_padding_size,
-                                                lat_h,
-                                                lat_w,
-                                                shift,
-                                                sample_solver,
-                                                sampling_steps,
-                                                guide_scale,
-                                                seed_g,
-                                                device,
-                                                offload_model=True,
-                                                is_last_section=False,
-                                                total_generated_frames=0,
-                                                progress_callback=None):
-        """Generate segment using frame packing with history at multiple scales"""
-        
-        # Get model
-        if hasattr(self, 'model_parallel') and self.model_parallel:
-            model = self.model
-        else:
-            model = getattr(self, 'model', self.model)
-        
-        try:
-            with amp.autocast(dtype=self.param_dtype), torch.no_grad():
-                # Setup scheduler
-                if sample_solver == 'unipc':
-                    sample_scheduler = FlowUniPCMultistepScheduler(
-                        num_train_timesteps=self.num_train_timesteps,
-                        shift=shift,
-                        use_dynamic_shifting=False)
-                    sample_scheduler.set_timesteps(
-                        sampling_steps, device=self.device, shift=shift)
-                    timesteps = sample_scheduler.timesteps
-                elif sample_solver == 'dpm++':
-                    sample_scheduler = FlowDPMSolverMultistepScheduler(
-                        num_train_timesteps=self.num_train_timesteps,
-                        shift=shift,
-                        use_dynamic_shifting=False)
-                    sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                    timesteps, _ = retrieve_timesteps(
-                        sample_scheduler,
-                        device=self.device,
-                        sigmas=sampling_sigmas)
-                else:
-                    raise NotImplementedError("Unsupported solver.")
-                
-                # Move inputs to device
-                msk = msk.to(device, dtype=torch.float16)
-                context = [t.to(device, dtype=torch.float16) for t in context]
-                context_null = [t.to(device, dtype=torch.float16) for t in context_null]
-                clip_context = clip_context.to(device, dtype=torch.float16)
-                
-                # Initialize latent for the full sequence
-                # Structure: [clean_pre(1), padding, new_frames, clean_post(1), 2x(2), 4x(16)]
-                total_frames = clean_latents.shape[2] + latent_padding_size + latent_window_size + 2 + 16
-                print(f"Debug: clean_latents.shape[2]={clean_latents.shape[2]}, latent_padding_size={latent_padding_size}, latent_window_size={latent_window_size}")
-                print(f"Debug: total_frames={total_frames}, msk.shape={msk.shape}")
-                
-                # Create a CUDA generator if needed
-                if device.type == 'cuda':
-                    cuda_generator = torch.Generator(device=device)
-                    cuda_generator.manual_seed(seed_g.initial_seed() if hasattr(seed_g, 'initial_seed') else 42)
-                    current_latent = torch.randn(
-                        1, 16, total_frames, lat_h, lat_w,
-                        generator=cuda_generator,
-                        device=device,
-                        dtype=torch.float16
-                    )
-                else:
-                    current_latent = torch.randn(
-                        1, 16, total_frames, lat_h, lat_w,
-                        generator=seed_g,
-                        device=device,
-                        dtype=torch.float16
-                    )
-                
-                # Fill in the known clean latents
-                # Pre and post frames (1x scale)
-                current_latent[:, :, clean_latent_indices[0], :, :] = clean_latents.to(dtype=torch.float16)
-                
-                # 2x scale frames
-                if clean_latents_2x.shape[2] > 0:
-                    current_latent[:, :, clean_latent_2x_indices[0], :, :] = clean_latents_2x.to(dtype=torch.float16)
-                
-                # 4x scale frames  
-                if clean_latents_4x.shape[2] > 0:
-                    current_latent[:, :, clean_latent_4x_indices[0], :, :] = clean_latents_4x.to(dtype=torch.float16)
-                
-                # Prepare mask with proper shape
-                # Expand mask to match temporal dimension
-                # Prepare mask with proper shape
-                if msk.dim() == 4:  # [C, T, H, W]
-                    # Always expand mask to match total_frames
-                    if msk.shape[1] == 1:
-                        msk_expanded = msk.repeat(1, total_frames, 1, 1)
+                                            msk,
+                                            clean_latents,
+                                            clean_latents_2x,
+                                            clean_latents_4x,
+                                            clean_latent_indices,
+                                            clean_latent_2x_indices,
+                                            clean_latent_4x_indices,
+                                            blank_indices,
+                                            latent_indices,
+                                            context,
+                                            context_null,
+                                            clip_context,
+                                            latent_window_size,
+                                            latent_padding_size,
+                                            lat_h,
+                                            lat_w,
+                                            shift,
+                                            sample_solver,
+                                            sampling_steps,
+                                            guide_scale,
+                                            seed_g,
+                                            device,
+                                            offload_model=True,
+                                            is_last_section=False,
+                                            total_generated_frames=0,
+                                            progress_callback=None):
+            """Generate segment using frame packing with history at multiple scales"""
+            
+            # Get model
+            if hasattr(self, 'model_parallel') and self.model_parallel:
+                model = self.model
+            else:
+                model = getattr(self, 'model', self.model)
+            
+            try:
+                with amp.autocast(dtype=self.param_dtype), torch.no_grad():
+                    # Setup scheduler
+                    if sample_solver == 'unipc':
+                        sample_scheduler = FlowUniPCMultistepScheduler(
+                            num_train_timesteps=self.num_train_timesteps,
+                            shift=shift,
+                            use_dynamic_shifting=False)
+                        sample_scheduler.set_timesteps(
+                            sampling_steps, device=self.device, shift=shift)
+                        timesteps = sample_scheduler.timesteps
+                    elif sample_solver == 'dpm++':
+                        sample_scheduler = FlowDPMSolverMultistepScheduler(
+                            num_train_timesteps=self.num_train_timesteps,
+                            shift=shift,
+                            use_dynamic_shifting=False)
+                        sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                        timesteps, _ = retrieve_timesteps(
+                            sample_scheduler,
+                            device=self.device,
+                            sigmas=sampling_sigmas)
                     else:
-                        # Use the first frame of mask and repeat it
-                        msk_expanded = msk[:, 0:1, :, :].repeat(1, total_frames, 1, 1)
-                else:
-                    raise ValueError(f"Unexpected mask shape: {msk.shape}")
-                
-                if msk_expanded.dim() == 4:
-                    msk_expanded = msk_expanded.unsqueeze(0)  # Add batch dimension
-                if current_latent.dim() == 4:
-                    current_latent = current_latent.unsqueeze(0)  # Add batch dimension
+                        raise NotImplementedError("Unsupported solver.")
                     
-                if msk_expanded.shape[1] != 20:
-                    if msk_expanded.shape[1] < 20:
-                        # Pad mask to 20 channels
-                        padding_channels = 20 - msk_expanded.shape[1]
-                        padding = torch.zeros(msk_expanded.shape[0], padding_channels, *msk_expanded.shape[2:], 
-                                            device=msk_expanded.device, dtype=msk_expanded.dtype)
-                        msk_expanded = torch.cat([msk_expanded, padding], dim=1)
+                    # Move inputs to device
+                    msk = msk.to(device, dtype=torch.float16)
+                    context = [t.to(device, dtype=torch.float16) for t in context]
+                    context_null = [t.to(device, dtype=torch.float16) for t in context_null]
+                    clip_context = clip_context.to(device, dtype=torch.float16)
+                    
+                    # Initialize latent for the full sequence
+                    # Structure: [clean_pre(1), padding, new_frames, clean_post(1), 2x(2), 4x(16)]
+                    total_frames = clean_latents.shape[2] + latent_padding_size + latent_window_size + 2 + 16
+                    print(f"Debug: clean_latents.shape[2]={clean_latents.shape[2]}, latent_padding_size={latent_padding_size}, latent_window_size={latent_window_size}")
+                    print(f"Debug: total_frames={total_frames}, msk.shape={msk.shape}")
+                    
+                    # Create a CUDA generator if needed
+                    if device.type == 'cuda':
+                        cuda_generator = torch.Generator(device=device)
+                        cuda_generator.manual_seed(seed_g.initial_seed() if hasattr(seed_g, 'initial_seed') else 42)
+                        current_latent = torch.randn(
+                            1, 16, total_frames, lat_h, lat_w,
+                            generator=cuda_generator,
+                            device=device,
+                            dtype=torch.float16
+                        )
                     else:
-                        # Truncate to 20 channels
-                        msk_expanded = msk_expanded[:, :20]
-
-                # model_input = torch.cat([msk_expanded, current_latent], dim=1)  # [1, 36, T, H, W]
-                
-                # Calculate max sequence length
-                max_seq_len = total_frames * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
-                self.sp_size = getattr(self, 'sp_size', 64)
-                max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
-                
-                # Main denoising loop
-                for step_idx, t in enumerate(timesteps):
-                    if progress_callback:
-                        progress_callback({
-                            'step': step_idx + 1,
-                            'total_steps': len(timesteps),
-                            'total_frames': total_generated_frames,
-                            'current_window': latent_window_size
-                        })
+                        current_latent = torch.randn(
+                            1, 16, total_frames, lat_h, lat_w,
+                            generator=seed_g,
+                            device=device,
+                            dtype=torch.float16
+                        )
                     
-                    # Prepare model input - concatenate mask and current latent
-                    model_input = torch.cat([msk_expanded, current_latent], dim=1)  # [1, 36, T, H, W]
+                    # Fill in the known clean latents
+                    # Pre and post frames (1x scale)
+                    current_latent[:, :, clean_latent_indices[0], :, :] = clean_latents.to(dtype=torch.float16)
                     
-                    # Remove batch dimension for model
-                    if model_input.dim() == 5 and model_input.shape[0] == 1:
-                        # Remove batch dimension: [1, 36, T, H, W] -> [36, T, H, W]
-                        model_input = model_input.squeeze(0)
-                    elif model_input.dim() == 4:
-                        # Already in correct format [36, T, H, W]
-                        pass
-                    else:
-                        print(f"Warning: Unexpected model_input shape: {model_input.shape}")
-  # [36, T, H, W]
-                    model_input_list = [model_input]
-                    
-                    # Prepare timestep
-                    timestep = torch.stack([t]).to(device)
-                    
-                    # Create conditioning y that includes both mask and latent
-                    y_cond = torch.cat([msk_expanded.squeeze(0), current_latent.squeeze(0)], dim=0)
-                    
-                    # Model arguments
-                    arg_c = {
-                        'context': context,
-                        'clip_fea': clip_context,
-                        'seq_len': max_seq_len,
-                        'y': model_input_list
-                    }
-                    arg_null = {
-                        'context': context_null,
-                        'clip_fea': clip_context,
-                        'seq_len': max_seq_len,
-                        'y': model_input_list
-                    }
-                    
-                    # Forward pass
-                    with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-                        # Conditional prediction
-                        noise_pred_cond = model(model_input_list, t=timestep, **arg_c)
-                        if isinstance(noise_pred_cond, list):
-                            noise_pred_cond = noise_pred_cond[0]
-                        
-                        # Extract only the latent part (last 16 channels)
-                        noise_pred_cond = noise_pred_cond[-16:, :, :, :]
-                        
-                        # Unconditional prediction
-                        noise_pred_uncond = model(model_input_list, t=timestep, **arg_null)
-                        if isinstance(noise_pred_uncond, list):
-                            noise_pred_uncond = noise_pred_uncond[0]
-                        
-                        # Extract only the latent part
-                        noise_pred_uncond = noise_pred_uncond[-16:, :, :, :]
-                        
-                        # Apply classifier-free guidance
-                        noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
-                    
-                    # Add batch dimension for scheduler
-                    noise_pred = noise_pred.unsqueeze(0)
-                    
-                    # Scheduler step
-                    current_latent = sample_scheduler.step(
-                        noise_pred,
-                        t,
-                        current_latent,
-                        return_dict=False,
-                        generator=cuda_generator if device.type == 'cuda' else seed_g
-                    )[0]
-                    
-                    # Re-apply clean latents (keep them fixed)
-                    current_latent[:, :, clean_latent_indices[0], :, :] = clean_latents
+                    # 2x scale frames
                     if clean_latents_2x.shape[2] > 0:
-                        current_latent[:, :, clean_latent_2x_indices[0], :, :] = clean_latents_2x
+                        current_latent[:, :, clean_latent_2x_indices[0], :, :] = clean_latents_2x.to(dtype=torch.float16)
+                    
+                    # 4x scale frames  
                     if clean_latents_4x.shape[2] > 0:
-                        current_latent[:, :, clean_latent_4x_indices[0], :, :] = clean_latents_4x
+                        current_latent[:, :, clean_latent_4x_indices[0], :, :] = clean_latents_4x.to(dtype=torch.float16)
                     
-                    # Clean up
-                    del noise_pred_cond, noise_pred_uncond, noise_pred
+                    # Prepare mask with proper shape
+                    if msk.dim() == 4:  # [C, T, H, W]
+                        # Always expand mask to match total_frames
+                        if msk.shape[1] == 1:
+                            msk_expanded = msk.repeat(1, total_frames, 1, 1)
+                        else:
+                            # Use the first frame of mask and repeat it
+                            msk_expanded = msk[:, 0:1, :, :].repeat(1, total_frames, 1, 1)
+                    else:
+                        raise ValueError(f"Unexpected mask shape: {msk.shape}")
                     
-                    if step_idx % 5 == 0:
-                        torch.cuda.empty_cache()
+                    if msk_expanded.dim() == 4:
+                        msk_expanded = msk_expanded.unsqueeze(0)  # Add batch dimension
+                        
+                    
+                    if current_latent.dim() == 4:
+                        current_latent = current_latent.unsqueeze(0)  # Add batch dimension
+                        
+                    if msk_expanded.shape[1] != 20:
+                        if msk_expanded.shape[1] < 20:
+                            # Pad mask to 20 channels
+                            padding_channels = 20 - msk_expanded.shape[1]
+                            padding = torch.zeros(msk_expanded.shape[0], padding_channels, *msk_expanded.shape[2:], 
+                                                device=msk_expanded.device, dtype=msk_expanded.dtype)
+                            msk_expanded = torch.cat([msk_expanded, padding], dim=1)
+                        else:
+                            # Truncate to 20 channels
+                            msk_expanded = msk_expanded[:, :20]
+                    
+                    # Calculate max sequence length
+                    max_seq_len = total_frames * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
+                    self.sp_size = getattr(self, 'sp_size', 64)
+                    max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+                    print(f"Input latent stats: mean={current_latent.mean().item():.4f}, std={current_latent.std().item():.4f}")
+                    # Main denoising loop
+                    for step_idx, t in enumerate(timesteps):
+                        if progress_callback:
+                            progress_callback({
+                                'step': step_idx + 1,
+                                'total_steps': len(timesteps),
+                                'total_frames': total_generated_frames,
+                                'current_window': latent_window_size
+                            })
+                       
+                        # Prepare inputs for the model
+                        # The model expects x (latent) and y (mask) separately
+                        # It will concatenate them internally in block_distributed_forward
+                        
+                        # Prepare latent input (remove batch dimension if needed)
+                        if current_latent.dim() == 5 and current_latent.shape[0] == 1:
+                            latent_input = current_latent.squeeze(0)  # [16, T, H, W]
+                        else:
+                            latent_input = current_latent
+                        print(f"\n{'='*60}")
+                        print(f"Step {step_idx + 1}/{len(timesteps)} - Timestep: {t.item() if hasattr(t, 'item') else t}")
+                        print(f"{'='*60}")
+                        latent_mean = latent_input.mean().item()
+                        latent_std = latent_input.std().item()
+                        latent_min = latent_input.min().item()
+                        latent_max = latent_input.max().item()
+                        print(f"Input latent stats: mean={latent_mean:.4f}, std={latent_std:.4f}, min={latent_min:.4f}, max={latent_max:.4f}")
+                        # Prepare mask input (remove batch dimension if needed)
+                        if msk_expanded.dim() == 5 and msk_expanded.shape[0] == 1:
+                            mask_input = msk_expanded.squeeze(0)  # [20, T, H, W]
+                        else:
+                            mask_input = msk_expanded
+                        
+                        # Create input list - just the latent part
+                        model_input_list = [latent_input]  # [16, T, H, W]
+                        
+                        # Create y list - just the mask part
+                        y_list = [mask_input]  # [20, T, H, W]
+                        
+                        # Prepare timestep
+                        timestep = torch.stack([t]).to(device)
+                        
+                        # Model arguments - pass latent as x and mask as y
+                        arg_c = {
+                            'context': context,
+                            'clip_fea': clip_context,
+                            'seq_len': max_seq_len,
+                            'y': y_list  # Pass mask separately
+                        }
+                        arg_null = {
+                            'context': context_null,
+                            'clip_fea': clip_context,
+                            'seq_len': max_seq_len,
+                            'y': y_list  # Pass mask separately
+                        }
+                        
+                        # Forward pass
+                        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                            # Conditional prediction - pass latent as main input
+                            noise_pred_cond = model(model_input_list, t=timestep, **arg_c)
+                            if isinstance(noise_pred_cond, list):
+                                noise_pred_cond = noise_pred_cond[0]
+                            
+                            # The model returns the full output including mask channels
+                            # We only need the latent part for denoising
+                            if noise_pred_cond.shape[0] > 16:
+                                # Extract only the latent part (last 16 channels)
+                                noise_pred_cond = noise_pred_cond[-16:, :, :, :]
+                            
+                            # Unconditional prediction
+                            noise_pred_uncond = model(model_input_list, t=timestep, **arg_null)
+                            if isinstance(noise_pred_uncond, list):
+                                noise_pred_uncond = noise_pred_uncond[0]
+                            
+                            # Extract only the latent part if needed
+                            if noise_pred_uncond.shape[0] > 16:
+                                noise_pred_uncond = noise_pred_uncond[-16:, :, :, :]
+                            
+                            # Apply classifier-free guidance
+                            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+                        
+                        # Add batch dimension for scheduler
+                        noise_pred = noise_pred.unsqueeze(0)
+                        
+                        # Scheduler step
+                        current_latent = sample_scheduler.step(
+                            noise_pred,
+                            t,
+                            current_latent,
+                            return_dict=False,
+                            generator=cuda_generator if device.type == 'cuda' else seed_g
+                        )[0]
+                        
+                        # Ensure current_latent is float16 to match other tensors
+                        current_latent = current_latent.to(dtype=torch.float16)
+                        
+                        # Re-apply clean latents (keep them fixed)
+                        current_latent[:, :, clean_latent_indices[0], :, :] = clean_latents.to(dtype=torch.float16)
+                        if clean_latents_2x.shape[2] > 0:
+                            current_latent[:, :, clean_latent_2x_indices[0], :, :] = clean_latents_2x.to(dtype=torch.float16)
+                        if clean_latents_4x.shape[2] > 0:
+                            current_latent[:, :, clean_latent_4x_indices[0], :, :] = clean_latents_4x.to(dtype=torch.float16)
+                            
+                        new_latent_mean = current_latent.mean().item()
+                        new_latent_std = current_latent.std().item()
+                        new_latent_min = current_latent.min().item()
+                        new_latent_max = current_latent.max().item()    
+                        print(f"Output latent stats: mean={new_latent_mean:.4f}, std={new_latent_std:.4f}, min={new_latent_min:.4f}, max={new_latent_max:.4f}")
                 
-                # Return the full latent sequence
-                return current_latent
-                
-        except Exception as e:
-            print(f"Error in frame packing generation: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+                        # Calculate change in latent
+                        # latent_change = (latent - inital).abs().mean().item()
+                        # print(f"Latent change magnitude: {latent_change:.4f}")
+                        
+                        # Check for NaN or extreme values
+                        if torch.isnan(current_latent).any():
+                            print("WARNING: NaN values detected in latent!")
+                        if current_latent.abs().max() > 100:
+                            print(f"WARNING: Extreme values in latent! Max abs value: {current_latent.abs().max().item():.4f}")
+                        # Clean up
+                        del noise_pred_cond, noise_pred_uncond, noise_pred
+                        
+                        if step_idx % 5 == 0:
+                            torch.cuda.empty_cache()
+                            
+                        # if step_idx == 9:
+                        #     break
+                    
+                    # Return the full latent sequence
+                    return current_latent
+                    
+            except Exception as e:
+                print(f"Error in frame packing generation: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
