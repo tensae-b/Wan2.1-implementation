@@ -423,10 +423,6 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
-            multi_gpu=True,        # Enable multi-GPU
-            model_parallel=True,  
-            # Enable model parallelism across GPUs
-            # offload_model=True 
         )
 
         logging.info("Generating video ...")
@@ -440,8 +436,7 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=True 
-            )
+            offload_model=args.offload_model)
     elif "flf2v" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
