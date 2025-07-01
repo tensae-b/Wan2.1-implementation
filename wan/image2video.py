@@ -1019,14 +1019,14 @@ class WanI2V:
         
         # Add the initial frame
         final_latent = torch.cat([start_latent.to(torch.device('cuda:3')), final_latent], dim=2)
-        final_latent=final_latent.squeeze(0)
+        
         # Decode the final video
         if self.rank == 0:
             if offload_model:
                 videos = self.vae.decode([final_latent])
             else:
                 videos = self.vae.decode([final_latent])
-        
+        final_latent=final_latent.squeeze(0)
         del final_latent, all_generated_latents, history_latents_1x
         gc.collect()
         torch.cuda.empty_cache()
