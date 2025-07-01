@@ -524,17 +524,7 @@ class WanI2V:
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
         sampling_steps=40
         
-        # if True== True:
-        #     print('here ')
-        #     latent_window_size=8
-        #     result=self._generate_with_frame_packing(
-        #             noise, y, msk, context, context_null, clip_context,
-        #             lat_h, lat_w, F, shift, sample_solver, sampling_steps,
-        #             guide_scale, seed_g, max_seq_len, latent_window_size,
-        #             offload_model
-        #         )
-        #     return result
-        # evaluation mode
+       
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
 
             if sample_solver == 'unipc':
@@ -689,18 +679,19 @@ class WanI2V:
                 del noise_pred_cond, noise_pred_uncond, noise_pred, temp_x0
                 # if step_idx == 19:
                 #     break
-                    
+               
                 # Force garbage collection and cache clearing
                 gc.collect()
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-
+                break
             if self.rank == 0:
                 if offload_model:
                     # Move final latent to GPU 3 where VAE is located
                     x0 = [latent.to(torch.device('cuda:3'))]
                     
-               
+                
+                
                 videos = self.vae.decode(x0)
 
         del noise, latent
@@ -755,34 +746,35 @@ class WanI2V:
         # y shape is (32, 16, frames, H, W) where first 16 channels are mask
         start_latent = y[:, 0:1, :, :].unsqueeze(0)# Shape: (1, 16, 1, H, W)
         start_latent=start_latent.to('cuda:0')
-        # Initialize scheduler
-        if sample_solver == 'unipc':
-            sample_scheduler = FlowUniPCMultistepScheduler(
-                num_train_timesteps=self.num_train_timesteps,
-                shift=shift,
-                use_dynamic_shifting=False)
-            sample_scheduler.set_timesteps(
-                sampling_steps, device=self.device, shift=shift)
-            timesteps = sample_scheduler.timesteps
-        elif sample_solver == 'dpm++':
-            sample_scheduler = FlowDPMSolverMultistepScheduler(
-                num_train_timesteps=self.num_train_timesteps,
-                shift=shift,
-                use_dynamic_shifting=False)
-            sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-            timesteps, _ = retrieve_timesteps(
-                sample_scheduler,
-                device=self.device,
-                sigmas=sampling_sigmas)
-        else:
-            raise NotImplementedError("Unsupported solver.")
+        
         
         all_generated_latents = []
         
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
             for section_idx in range(num_sections):
-                print(f"\nGenerating section {section_idx + 1}/{num_sections}")
                 
+                print(f"\nGenerating section {section_idx + 1}/{num_sections}")
+                # Initialize scheduler
+                if sample_solver == 'unipc':
+                    sample_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=shift,
+                        use_dynamic_shifting=False)
+                    sample_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
+                    timesteps = sample_scheduler.timesteps
+                elif sample_solver == 'dpm++':
+                    sample_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=shift,
+                        use_dynamic_shifting=False)
+                    sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                    timesteps, _ = retrieve_timesteps(
+                        sample_scheduler,
+                        device=self.device,
+                        sigmas=sampling_sigmas)
+                else:
+                    raise NotImplementedError("Unsupported solver.")
                 # Calculate frame indices for this section
                 start_frame = section_idx * frames_per_section
                 end_frame = min(start_frame + frames_per_section, total_frames - 1)
@@ -888,14 +880,14 @@ class WanI2V:
                     
                     
                 # Extract the window portion that will be denoised
-                if section_frames < latent_window_size:
-                    # Pad if this is the last section with fewer frames
-                    padding_needed = latent_window_size - section_frames
-                    padding = torch.zeros(16, padding_needed, actual_h, actual_w,
-                                        dtype=section_noise.dtype, device=section_noise.device)
-                    window_latent = torch.cat([section_noise, padding], dim=1)
-                else:
-                    window_latent = section_noise
+                # if section_frames < latent_window_size:
+                #     # Pad if this is the last section with fewer frames
+                #     padding_needed = latent_window_size - section_frames
+                #     padding = torch.zeros(16, padding_needed, actual_h, actual_w,
+                #                         dtype=section_noise.dtype, device=section_noise.device)
+                #     window_latent = torch.cat([section_noise, padding], dim=1)
+                # else:
+                window_latent = section_noise
                 
                 y_mask = torch.zeros(4, latent_window_size, actual_h, actual_w, device=section_noise.device)
                 if section_idx == 0:
@@ -934,7 +926,7 @@ class WanI2V:
                 
                 # Initialize latent for denoising (just the window portion)
                 section_latent = window_latent
-                
+                print('section_latent', section_latent.shape)
                 # Run denoising steps
                 for step_idx, t in enumerate(tqdm(timesteps, desc=f"Section {section_idx + 1}")):
                     torch.cuda.empty_cache()
@@ -995,9 +987,12 @@ class WanI2V:
                         generator=seed_g)[0]
                     section_latent = temp_x0.squeeze(0)
                     
+                    print('section_latent', section_latent.shape)
+                    
                     del noise_pred_cond, noise_pred_uncond, noise_pred, temp_x0
                     gc.collect()
                     torch.cuda.empty_cache()
+                    
                 
                 # Extract generated frames for this section
                 generated_frames = section_latent[:, :section_frames, :, :]
@@ -1012,20 +1007,27 @@ class WanI2V:
                 del section_latent, section_noise, combined_latents, section_y
                 torch.cuda.empty_cache()
                 gc.collect()
-                break
+                
         
         # Combine all generated latents
         final_latent = torch.cat(all_generated_latents, dim=2).to(torch.device('cuda:3'))
-        
+        print('before concat final_latent', final_latent.shape)
         # Add the initial frame
+        
+        print('start latent', start_latent.shape)
         final_latent = torch.cat([start_latent.to(torch.device('cuda:3')), final_latent], dim=2)
-        final_latent=final_latent.squeeze(0)
+        print('final latent', final_latent.shape)
+        final_latent= final_latent.squeeze(0)
+        to_decode = [final_latent.to(torch.device('cuda:3'))]
+        print('to_decode', to_decode[0].shape)
         # Decode the final video
         if self.rank == 0:
             if offload_model:
-                videos = self.vae.decode([final_latent])
+                videos = self.vae.decode(to_decode)
             else:
-                videos = self.vae.decode([final_latent])
+                videos = self.vae.decode(to_decode)
+                
+        
         
         del final_latent, all_generated_latents, history_latents_1x
         gc.collect()
