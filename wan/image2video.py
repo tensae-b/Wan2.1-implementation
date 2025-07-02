@@ -740,6 +740,7 @@ class WanI2V:
         print(f"Generating {total_frames} frames in {num_sections} sections")
         
         start_latent =  y[:, 0, :, :]   # Shape: (16, H, W) - remove batch and frame dims
+        
         start_mask =  torch.ones(4, start_latent.shape[1], start_latent.shape[2], 
                            dtype=start_latent.dtype, device=start_latent.device)    # Shape: (4, H, W) - remove batch and frame dims
         
