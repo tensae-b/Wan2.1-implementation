@@ -725,221 +725,191 @@ class WanI2V:
         This method generates videos in sections, using previously generated frames
         as context for generating new frames, maintaining temporal coherence.
         """
+        
         @contextmanager
         def noop_no_sync():
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-        
-        # Calculate actual dimensions
-        actual_h = lat_h
-        actual_w = lat_w
-        
-        # Initialize history lists to store generated latents
-        history_latents_1x = []  # Full resolution history
-        
+        sampling_steps=60
         # Calculate total frames needed
-        total_frames = (F - 1) // 4 + 1  # Total latent frames
-        
-        # Define padding size based on latent window size
-        latent_padding_size = max(4, latent_window_size // 2)
-        
-        # Calculate number of sections needed
+        total_frames = (F - 1) // 4 + 1
         frames_per_section = latent_window_size
-        num_sections = math.ceil((total_frames - 1) / frames_per_section)
+        num_sections = math.ceil(total_frames / frames_per_section)
         
-        print(f"Generating {total_frames} latent frames in {num_sections} sections")
-        print(f"Latent window size: {latent_window_size}, padding size: {latent_padding_size}")
+        print(f"Generating {total_frames} frames in {num_sections} sections")
         
-        # Extract the first frame from y (the encoded input image)
-        # y shape is (32, 16, frames, H, W) where first 16 channels are mask
-        start_latent = y[:, 0:1, :, :].unsqueeze(0)# Shape: (1, 16, 1, H, W)
-        start_latent=start_latent.to('cuda:0')
-        # Initialize scheduler
-        if sample_solver == 'unipc':
-            sample_scheduler = FlowUniPCMultistepScheduler(
-                num_train_timesteps=self.num_train_timesteps,
-                shift=shift,
-                use_dynamic_shifting=False)
-            sample_scheduler.set_timesteps(
-                sampling_steps, device=self.device, shift=shift)
-            timesteps = sample_scheduler.timesteps
-        elif sample_solver == 'dpm++':
-            sample_scheduler = FlowDPMSolverMultistepScheduler(
-                num_train_timesteps=self.num_train_timesteps,
-                shift=shift,
-                use_dynamic_shifting=False)
-            sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-            timesteps, _ = retrieve_timesteps(
-                sample_scheduler,
-                device=self.device,
-                sigmas=sampling_sigmas)
-        else:
-            raise NotImplementedError("Unsupported solver.")
+        start_latent =  y[:, 0, :, :]   # Shape: (16, H, W) - remove batch and frame dims
+        start_mask =  torch.ones(4, start_latent.shape[1], start_latent.shape[2], 
+                           dtype=start_latent.dtype, device=start_latent.device)    # Shape: (4, H, W) - remove batch and frame dims
         
+        print(f"Start latent shape: {start_latent.shape}")
+        print(f"Start mask shape: {start_mask.shape}")
+        
+        # History storage
+        history_frames = []  # All generated frames
         all_generated_latents = []
+        
+        device = start_latent.device
+        dtype = start_latent.dtype
         
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
             for section_idx in range(num_sections):
                 print(f"\nGenerating section {section_idx + 1}/{num_sections}")
                 
+                # Initialize scheduler
+                if sample_solver == 'unipc':
+                    sample_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=shift, use_dynamic_shifting=False)
+                    sample_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
+                    timesteps = sample_scheduler.timesteps
+                elif sample_solver == 'dpm++':
+                    sample_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=shift, use_dynamic_shifting=False)
+                    sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                    timesteps, _ = retrieve_timesteps(sample_scheduler, device=self.device, sigmas=sampling_sigmas)
+                else:
+                    raise NotImplementedError("Unsupported solver.")
+                
                 # Calculate frame indices for this section
                 start_frame = section_idx * frames_per_section
-                end_frame = min(start_frame + frames_per_section, total_frames - 1)
+                end_frame = min(start_frame + frames_per_section, total_frames)
                 section_frames = end_frame - start_frame
                 
-                # Create section-specific noise
-                section_noise = noise[:, start_frame:end_frame, :, :].clone()
+                # ============================================
+                # CREATE ALIGNED Y AND NOISE TENSORS
+                # ============================================
                 
-                # Define the structure of our combined latent
-                # Order: [clean_pre(1), clean_post(1), padding, window, 2x_history(2), 4x_history(16)]
-                clean_frames = 2  # pre + post
-                total_context_frames = clean_frames + latent_padding_size + latent_window_size + 2 + 16
+                # FIX: Use 4-channel mask (not 16) to get 20 total channels in y
+                # Model expects: y(20 channels) + noise(16 channels) = 36 total channels
                 
-                # Add debug print
-                print(f"start_latent shape: {start_latent.shape}")
+                section_mask = torch.zeros(4, latent_window_size, lat_h, lat_w, dtype=dtype, device=device)   # 4 channels!
+                section_latents = torch.zeros(16, latent_window_size, lat_h, lat_w, dtype=dtype, device=device)  # 16 channels
+                section_noise = torch.zeros(16, latent_window_size, lat_h, lat_w, dtype=dtype, device=device)    # 16 channels
                 
-                # Prepare clean latents for this section
+                # Track which frames are context vs generation
+                frame_types = []  # 'context' or 'generation'
+                
                 if section_idx == 0:
-                    # First section: only start_latent as pre, no post
-                    clean_latents_pre = start_latent
-                    # Create tensors on the same device as start_latent
-                    device = start_latent.device
-                    dtype = start_latent.dtype
-                    clean_latents_post = torch.zeros(1, 16, 1, actual_h, actual_w, dtype=dtype, device=device)
-                    clean_latents_2x = torch.zeros(1, 16, 2, actual_h, actual_w, dtype=dtype, device=device)
-                    clean_latents_4x = torch.zeros(1, 16, 16, actual_h, actual_w, dtype=dtype, device=device)
+                    # First section: start frame + generation frames
+                    
+                    # Frame 0: Start frame (context)
+                    section_mask[:, 0, :, :] = start_mask  # Shape: (4, H, W) -> (4, H, W)
+                    section_latents[:, 0, :, :] = start_latent  # Shape: (16, H, W) -> (16, H, W)
+                    section_noise[:, 0, :, :] = 0  # Ignored for context frames
+                    frame_types.append('context')
+                    
+                    # Frames 1 to section_frames: Generation frames
+                    for i in range(1, section_frames):
+                        if i < latent_window_size:
+                            section_mask[:, i, :, :] = 0  # mask=0 means generate
+                            section_latents[:, i, :, :] = 0  # Zero latent for generation frames
+                            section_noise[:, i, :, :] = noise[:, start_frame + i - 1, :, :]  # Actual noise
+                            frame_types.append('generation')
+                    
+                    # Pad remaining frames if needed
+                    for i in range(section_frames, latent_window_size):
+                        section_mask[:, i, :, :] = 0
+                        section_latents[:, i, :, :] = 0
+                        section_noise[:, i, :, :] = 0  # Zero padding
+                        frame_types.append('padding')
+                    
                 else:
-                    # Subsequent sections: use previously generated frames
-                    clean_latents_pre = start_latent
-                    device = start_latent.device
-                    dtype = start_latent.dtype
+                    # Subsequent sections: context frames + generation frames
+                    context_positions = []
+                    generation_positions = []
                     
-                    # Get the most recent generated frame as post
-                    if history_latents_1x:
-                        clean_latents_post = history_latents_1x[-1:][0].to(device=device, dtype=dtype)
-                    else:
-                        clean_latents_post = torch.zeros(1, 16, 1, actual_h, actual_w, dtype=dtype, device=device)
+                    # Determine context frame positions (hierarchical sampling)
+                    context_frames_to_add = []
                     
-                    # Get 2x downsampled history (every 2nd frame from recent history)
-                    if len(history_latents_1x) >= 2:
-                        frames_2x = []
-                        frames_2x.append(history_latents_1x[-2].to(device=device, dtype=dtype) if len(history_latents_1x) >= 2 else torch.zeros(1, 16, 1, actual_h, actual_w, dtype=dtype, device=device))
-                        frames_2x.append(history_latents_1x[-4].to(device=device, dtype=dtype) if len(history_latents_1x) >= 4 else torch.zeros(1, 16, 1, actual_h, actual_w, dtype=dtype, device=device))
-                        clean_latents_2x = torch.cat(frames_2x, dim=2)  # Shape: (1, 16, 2, H, W)
-                    else:
-                        clean_latents_2x = torch.zeros(1, 16, 2, actual_h, actual_w, dtype=dtype, device=device)
+                    # Add recent frames (1-3 most recent)
+                    num_recent = min(3, len(history_frames))
+                    for i in range(num_recent):
+                        if len(context_positions) < latent_window_size // 2:  # Don't use more than half for context
+                            context_frames_to_add.append(history_frames[-(i+1)])
+                            context_positions.append(len(context_positions))
                     
-                    # Get 4x downsampled history (every 4th frame from recent history)
-                    if len(history_latents_1x) >= 16:
-                        frames_4x = []
-                        for i in range(16):
-                            idx = -(i * 4 + 1)  # Sample every 4th frame going backwards
-                            if abs(idx) <= len(history_latents_1x):
-                                frames_4x.append(history_latents_1x[idx].to(device=device, dtype=dtype))
-                            else:
-                                frames_4x.append(torch.zeros(1, 16, 1, actual_h, actual_w, dtype=dtype, device=device))
-                        clean_latents_4x = torch.cat(frames_4x[::-1], dim=2)  # Reverse to maintain temporal order
-                    else:
-                        clean_latents_4x = torch.zeros(1, 16, 16, actual_h, actual_w, dtype=dtype, device=device)
-                
-                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-                
-                # Create padding (blank frames)
-                blank_latents = torch.zeros(1, 16, latent_padding_size, actual_h, actual_w, 
-                                           dtype=section_noise.dtype, device=section_noise.device)
-                
-                # Pad section noise if needed
-                if section_frames < latent_window_size:
-                    padding_needed = latent_window_size - section_frames
-                    padding = torch.zeros(16, padding_needed, actual_h, actual_w,
-                                        dtype=section_noise.dtype, device=section_noise.device)
-                    section_noise = torch.cat([section_noise, padding], dim=1)
-                clean_latents= clean_latents.to('cuda:0')
-                blank_latents=blank_latents.to('cuda:0')
-                section_noise=section_noise.to('cuda:0')
-                clean_latents_2x=clean_latents_2x.to('cuda:0')
-                clean_latents_4x=clean_latents_4x.to('cuda:0')
-                # Combine all latents in the correct order
-                combined_latents = torch.cat([
-                    clean_latents,
-                    blank_latents,
-                    section_noise.unsqueeze(0),
-                    clean_latents_2x,
-                    clean_latents_4x
-                ], dim=2)  # Shape: (1, 16, total_frames, H, W)
-                
-                # For frame packing, we process each window but y should only contain
-                # the mask and latent for the current window being generated
-                if section_idx == 0:
-                    # Create 4-channel mask (not 16)
-                    y_mask = torch.zeros(4, latent_window_size, actual_h, actual_w, device=section_noise.device)
-                    y_mask[:, 0] = 1.0  # Mark first frame as clean
+                    # Add medium-term frames (every 2nd frame)
+                    for i in range(2):
+                        idx = -(4 + i * 2)  # -4, -6
+                        if abs(idx) <= len(history_frames) and len(context_positions) < latent_window_size // 2:
+                            context_frames_to_add.append(history_frames[idx])
+                            context_positions.append(len(context_positions))
                     
-                    # Create 16-channel latent
-                    y_latent = torch.zeros(16, latent_window_size, actual_h, actual_w, device=section_noise.device)
-                    y_latent[:, 0] = y[:, 0, :, :]  # Copy the first frame from original y
+                    # Add long-term frames (every 4th frame)
+                    for i in range(min(8, latent_window_size // 2 - len(context_positions))):
+                        idx = -(8 + i * 4)  # -8, -12, -16, etc.
+                        if abs(idx) <= len(history_frames):
+                            context_frames_to_add.append(history_frames[idx])
+                            context_positions.append(len(context_positions))
                     
-                    section_y = torch.cat([y_mask, y_latent], dim=0)  # Shape: (20, window_size, H, W)
-                else:
-                    # Subsequent sections: all zeros
-                    section_y = torch.zeros(20, latent_window_size, actual_h, actual_w, 
-                                        dtype=y.dtype, device=section_noise.device)
+                    # Fill context positions
+                    for i, frame in enumerate(context_frames_to_add):
+                        if i < len(context_positions):
+                            pos = context_positions[i]
+                            section_mask[:, pos, :, :] = 1  # Simple mask for context frame (all 4 channels = 1)
+                            section_latents[:, pos, :, :] = frame.squeeze(1) if frame.dim() == 3 else frame.squeeze()
+                            section_noise[:, pos, :, :] = 0  # Ignored
+                            frame_types.append('context')
                     
+                    # Fill generation positions
+                    generation_start = len(context_positions)
+                    for i in range(generation_start, min(generation_start + section_frames, latent_window_size)):
+                        section_mask[:, i, :, :] = 0  # Generate this frame
+                        section_latents[:, i, :, :] = 0  # Zero latent
+                        noise_idx = start_frame + (i - generation_start)
+                        if noise_idx < noise.shape[1]:
+                            section_noise[:, i, :, :] = noise[:, noise_idx, :, :]
+                        frame_types.append('generation')
                     
-                # Extract the window portion that will be denoised
-                if section_frames < latent_window_size:
-                    # Pad if this is the last section with fewer frames
-                    padding_needed = latent_window_size - section_frames
-                    padding = torch.zeros(16, padding_needed, actual_h, actual_w,
-                                        dtype=section_noise.dtype, device=section_noise.device)
-                    window_latent = torch.cat([section_noise, padding], dim=1)
-                else:
-                    window_latent = section_noise
+                    # Pad remaining positions
+                    for i in range(len(frame_types), latent_window_size):
+                        section_mask[:, i, :, :] = 0
+                        section_latents[:, i, :, :] = 0
+                        section_noise[:, i, :, :] = 0
+                        frame_types.append('padding')
+                    
+                    print(f"Context positions: {context_positions}")
+                    print(f"Generation frames: {sum(1 for t in frame_types if t == 'generation')}")
                 
-                y_mask = torch.zeros(4, latent_window_size, actual_h, actual_w, device=section_noise.device)
-                if section_idx == 0:
-                    y_mask[:, 0] = 1.0  # First frame is clean
-
-                # Pad y_latent if needed to match window size
-                if y_latent.shape[1] < latent_window_size:
-                    padding_needed = latent_window_size - y_latent.shape[1]
-                    padding = torch.zeros(16, padding_needed, actual_h, actual_w,
-                                        dtype=y_latent.dtype, device=y_latent.device)
-                    y_latent = torch.cat([y_latent, padding], dim=1)
-
-                # Combine mask and latent as in original code
-                section_y = torch.cat([y_mask, y_latent], dim=0)  
+                # Combine mask and latent for y (4 + 16 = 20 channels)
+                section_y = torch.cat([section_mask, section_latents], dim=0)  # Shape: (20, latent_window_size, H, W)
                 
-                # Debug print to verify dimensions
-                print(f"Section noise shape: {section_noise.shape}")
-                print(f"Section y shape: {section_y.shape}")
-                # print(f"Section latent shape: {section_latent.shape}")
+                print(f"Section Y shape: {section_y.shape}")  # Should be (20, 8, 90, 68)
+                print(f"Section noise shape: {section_noise.shape}")  # Should be (16, 8, 90, 68)
+                print(f"Total input channels: {section_y.shape[0] + section_noise.shape[0]}")  # Should be 36
+                print(f"Frame types: {frame_types}")
                 
-                # Prepare arguments for model
-                # The model expects y to contain mask+latent, but as a 4D tensor after squeezing
+                # ============================================
+                # MODEL ARGUMENTS
+                # ============================================
+                
                 arg_c = {
                     'context': [context[0]],
                     'clip_fea': clip_context,
                     'seq_len': max_seq_len,
-                    'y': [section_y.squeeze(0)],  # Remove batch dimension to match expected format
+                    'y': [section_y],  # Shape: (20, latent_window_size, H, W) - 4 mask + 16 latent channels
                 }
                 
                 arg_null = {
                     'context': context_null,
                     'clip_fea': clip_context,
                     'seq_len': max_seq_len,
-                    'y': [section_y.squeeze(0)],  # Remove batch dimension to match expected format
+                    'y': [section_y],
                 }
                 
-                # Initialize latent for denoising (just the window portion)
-                section_latent = window_latent
+                # ============================================
+                # DENOISING LOOP
+                # ============================================
                 
-                # Run denoising steps
+                section_latent = section_noise  # Shape: (16, latent_window_size, H, W)
+                
                 for step_idx, t in enumerate(tqdm(timesteps, desc=f"Section {section_idx + 1}")):
                     torch.cuda.empty_cache()
                     
-                    # Prepare model input
+                    # Both y and latent_model_input have the same temporal dimension
                     latent_model_input = [section_latent.to(torch.device('cuda:0'))]
                     timestep = torch.stack([t]).to(torch.device('cuda:0'))
                     
@@ -998,27 +968,31 @@ class WanI2V:
                     del noise_pred_cond, noise_pred_uncond, noise_pred, temp_x0
                     gc.collect()
                     torch.cuda.empty_cache()
+                    
                 
-                # Extract generated frames for this section
-                generated_frames = section_latent[:, :section_frames, :, :]
+                # ============================================
+                # EXTRACT GENERATED FRAMES
+                # ============================================
                 
-                # Add to history
-                for frame_idx in range(section_frames):
-                    frame = generated_frames[:, frame_idx:frame_idx+1, :, :].unsqueeze(0)
-                    history_latents_1x.append(frame.cpu())
-                    all_generated_latents.append(frame)
+                # Only save frames that were actually generated (not context frames)
+                for i, frame_type in enumerate(frame_types):
+                    if frame_type == 'generation' and i < section_latent.shape[1]:
+                        frame = section_latent[:, i:i+1, :, :].clone()  # Shape: (16, 1, H, W)
+                        history_frames.append(frame.cpu())
+                        all_generated_latents.append(frame.unsqueeze(0))  # Add batch dim
                 
-                # Clear memory
-                del section_latent, section_noise, combined_latents, section_y
+                print(f"Section {section_idx} complete. Added {sum(1 for t in frame_types if t == 'generation')} frames. Total history: {len(history_frames)}")
+                
+                # Cleanup
+                del section_latent, section_y, section_mask, section_latents, section_noise
                 torch.cuda.empty_cache()
                 gc.collect()
-                break
-        
+                
         # Combine all generated latents
         final_latent = torch.cat(all_generated_latents, dim=2).to(torch.device('cuda:3'))
-        
-        # Add the initial frame
-        final_latent = torch.cat([start_latent.to(torch.device('cuda:3')), final_latent], dim=2)
+        start_latent_expanded = start_latent.unsqueeze(0).unsqueeze(2).to('cuda:3')  # Shape: (1, 16, 1, H, W)
+        final_latent = torch.cat([start_latent_expanded, final_latent], dim=2) 
+        final_latent=final_latent.squeeze(0)
         
         # Decode the final video
         if self.rank == 0:
@@ -1026,8 +1000,8 @@ class WanI2V:
                 videos = self.vae.decode([final_latent])
             else:
                 videos = self.vae.decode([final_latent])
-        final_latent=final_latent.squeeze(0)
-        del final_latent, all_generated_latents, history_latents_1x
+        
+        del final_latent, all_generated_latents
         gc.collect()
         torch.cuda.empty_cache()
         
