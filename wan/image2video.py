@@ -757,10 +757,7 @@ class WanI2V:
                                    guide_scale, seed_g, max_seq_len, latent_window_size,
                                    offload_model):
         """
-        Generate long videos using frame packing technique.
-        
-        This method generates videos in sections, using previously generated frames
-        as context for generating new frames, maintaining temporal coherence.
+        Generate long videos using frame packing technique with improved temporal coherence.
         """
         
         @contextmanager
@@ -768,36 +765,28 @@ class WanI2V:
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-        sampling_steps=40
-        # Calculate total frames needed
-        latent_window_size=21
+        sampling_steps = 40
+        latent_window_size = 21
         total_frames = 63
-        frames_per_section = latent_window_size
+        
+        # Key improvement: Add overlap between sections for continuity
+        overlap_frames = 8  # Number of frames to overlap between sections
+        frames_per_section = latent_window_size 
+        
+        # Calculate sections with overlap
+        if overlap_frames >= latent_window_size:
+            raise ValueError("Overlap frames must be less than window size")
+        
         num_sections = math.ceil(total_frames / frames_per_section)
-        
-        print(f"Generating {total_frames} frames in {num_sections} sections")
-        
-        start_latent =  y  # Shape: (16, H, W) - remove batch and frame dims
-        
-        
-        noise = torch.randn(
-            16,latent_window_size ,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device)
-        
-        print('noise', noise.shape)
 
         
-        # History storage
-        history_frames = []  # All generated frames
-        all_generated_latents = []
+        print(f"Generating {total_frames} frames in {num_sections} sections with {overlap_frames} frame overlap")
         
-        device = start_latent.device
+        start_latent = y
+        all_generated_frames = []  # Store all frames sequentially
+        
+        device = self.device
         dtype = start_latent.dtype
-        
         
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
             for section_idx in range(num_sections):
@@ -818,333 +807,274 @@ class WanI2V:
                     timesteps, _ = retrieve_timesteps(sample_scheduler, device=self.device, sigmas=sampling_sigmas)
                 else:
                     raise NotImplementedError("Unsupported solver.")
-                if section_idx ==0 :
+                
+                if section_idx == 0:
+                    # First section: generate full window
+                    frames_to_generate = latent_window_size
+                    context_frames = None
                     
-                   
-                    latent = noise
+                    # Initialize noise for first section
+                    section_noise = torch.randn(
+                        16, latent_window_size,
+                        lat_h, lat_w,
+                        dtype=torch.float32,
+                        generator=seed_g,
+                        device=self.device)
                     
-                    y = torch.concat([msk, y])
-                    print('here at section 1', y.shape,latent.shape)
-                    
-                    arg_c = {
-                        'context': [context[0]],
-                        'clip_fea': clip_context,
-                        'seq_len': max_seq_len,
-                        'y': [y],
-                    }
-
-                    arg_null = {
-                        'context': context_null,
-                        'clip_fea': clip_context,
-                        'seq_len': max_seq_len,
-                        'y': [y],
-                    }
-                    inital= latent
-                    if offload_model:
-                        torch.cuda.empty_cache()
-                    print(f"Input latent stats:  std={latent.std().item():.4f}")
-
-                    for step_idx, t in enumerate(tqdm(timesteps)):
-                        # Clear all GPU caches before each timestep
-                        torch.cuda.empty_cache()
-                        # Log step info
-                        print(f"\n{'='*60}")
-                        print(f"Step {step_idx + 1}/{len(timesteps)} - Timestep: {t.item() if hasattr(t, 'item') else t}")
-                        print(f"{'='*60}")
-                        latent_mean = latent.mean().item()
-                        latent_std = latent.std().item()
-                        latent_min = latent.min().item()
-                        latent_max = latent.max().item()
-                        print(f"Input latent stats: mean={latent_mean:.4f}, std={latent_std:.4f}, min={latent_min:.4f}, max={latent_max:.4f}")
-                        
-
-                        # Start processing on GPU 0 (where embeddings are)
-                        latent_model_input = [latent.to(torch.device('cuda:0'))]
-                        timestep = [t]
-                        timestep = torch.stack(timestep).to(torch.device('cuda:0'))
-                        
-                        # Move arg_c to GPU 0 for initial processing (only what's needed)
-                        arg_c_gpu0 = {}
-                        for key, value in arg_c.items():
-                            if isinstance(value, torch.Tensor):
-                                arg_c_gpu0[key] = value.to(torch.device('cuda:0'))
-                            elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-                                arg_c_gpu0[key] = [v.to(torch.device('cuda:0')) for v in value]
-                            else:
-                                arg_c_gpu0[key] = value
-
-                        # Forward pass through distributed model - output will be on GPU 3
-                        noise_pred_cond = self.model(
-                            latent_model_input, t=timestep, **arg_c_gpu0)[0]
-                        
-                        # Immediately move to CPU to free GPU 3 memory
-                        noise_pred_cond = noise_pred_cond.to(torch.device('cpu'))
-                        cond_mean = noise_pred_cond.mean().item()
-                        cond_std = noise_pred_cond.std().item()
-                        print(f"Conditional noise pred: mean={cond_mean:.4f}, std={cond_std:.4f}")
-                        # Clear intermediate results and GPU caches
-                        del latent_model_input, arg_c_gpu0
-                        torch.cuda.empty_cache()
-                        
-                        # Second forward pass for unconditional - fresh start
-                        latent_model_input = [latent.to(torch.device('cuda:0'))]
-                        timestep = torch.stack([t]).to(torch.device('cuda:0'))
-                        
-                        arg_null_gpu0 = {}
-                        for key, value in arg_null.items():
-                            if isinstance(value, torch.Tensor):
-                                arg_null_gpu0[key] = value.to(torch.device('cuda:0'))
-                            elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-                                arg_null_gpu0[key] = [v.to(torch.device('cuda:0')) for v in value]
-                            else:
-                                arg_null_gpu0[key] = value
-                        
-                        noise_pred_uncond = self.model(
-                            latent_model_input, t=timestep, **arg_null_gpu0)[0]
-                        
-                        # Immediately move to CPU
-                        noise_pred_uncond = noise_pred_uncond.to(torch.device('cpu'))
-                        uncond_mean = noise_pred_uncond.mean().item()
-                        uncond_std = noise_pred_uncond.std().item()
-                        print(f"Unconditional noise pred: mean={uncond_mean:.4f}, std={uncond_std:.4f}")
-                        # Clear all intermediate results
-                        del latent_model_input, timestep, arg_null_gpu0
-                        torch.cuda.empty_cache()
-                        
-                        # Compute guidance on CPU to save GPU memory
-                        noise_pred = noise_pred_uncond + guide_scale * (
-                            noise_pred_cond - noise_pred_uncond)
-                        
-                        guidance_diff = (noise_pred_cond - noise_pred_uncond).abs().mean().item()
-                        print(f"Guidance effect magnitude: {guidance_diff:.4f}")
-                        print(f"Guidance scale: {guide_scale}")
-                        
-                        noise_mean = noise_pred.mean().item()
-                        noise_std = noise_pred.std().item()
-                        print(f"Final noise pred: mean={noise_mean:.4f}, std={noise_std:.4f}")
-                        # Move latent to CPU for scheduler step
-                        latent = latent.to(torch.device('cpu'))
-
-                        temp_x0 = sample_scheduler.step(
-                            noise_pred.unsqueeze(0),
-                            t,
-                            latent.unsqueeze(0),
-                            return_dict=False,
-                            generator=seed_g)[0]
-                        latent = temp_x0.squeeze(0)
-                        print(latent.shape,'section latent')
-                        gc.collect()
-                       
-                        torch.cuda.empty_cache()
-                        
-                        
-                        # all_generated_latents.append(section_latent)
-                        
-                    all_generated_latents.append(latent)
-                    del latent
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    
-                   
-                    
-                   
+                    latent = section_noise
+                    y_section = torch.concat([msk, y])
                     
                 else:
-                    latent = noise
-                    print('all generated',len(all_generated_latents))
-                    if len(all_generated_latents) >= 3:
+                    # Subsequent sections: use overlapping frames as context
+                    frames_to_generate = min(latent_window_size, total_frames - len(all_generated_frames))
+
+                    # Smart context sampling
+                    if len(all_generated_frames) >= 12:  # Need at least some frames for context
+                        available_frames = len(all_generated_frames)
                         
-                        recent_latent=all_generated_latents[-1]
-                        recent_context=recent_latent[:, -12:, :, :] 
+                        # Define context regions for smart sampling
+                        # Short-range: most recent frames (most important)
+                        short_range_frames = 6
+                        # Mid-range: frames from middle distance
+                        mid_range_frames = 4
+                        # Long-range: frames from further back
+                        long_range_frames = 2
+                        total_context_frames = short_range_frames + mid_range_frames + long_range_frames
                         
-                        mid_latent=all_generated_latents[-2] 
-                        mid_indices = [20, 18, 16, 14,12,10]
-                        mid_context=mid_latent[:, mid_indices, :, :]
-                        long_indices=[20,16,12]
-                        long_latent=all_generated_latents[-3] 
-                        long_context=long_latent[:, long_indices, :, :]
+                        context_indices = []
                         
+                        # Short-range context: most recent frames (continuous)
+                        short_start = max(0, available_frames - short_range_frames)
+                        short_indices = list(range(short_start, available_frames))
+                        context_indices.extend(short_indices)
                         
-                        contexts = torch.cat([recent_context, mid_context, long_context], dim=1)
+                        # Mid-range context: sample with stride
+                        if available_frames > short_range_frames + 4:
+                            mid_start = max(0, available_frames - 20)
+                            mid_end = available_frames - short_range_frames
+                            mid_stride = max(2, (mid_end - mid_start) // mid_range_frames)
+                            mid_indices = list(range(mid_start, mid_end, mid_stride))[-mid_range_frames:]
+                            context_indices.extend(mid_indices)
                         
-                    
+                        # Long-range context: key frames from earlier sections
+                        if available_frames > 30:
+                            long_stride = max(10, available_frames // 4)
+                            long_indices = []
+                            
+                            for i in range(0, available_frames - 20, long_stride):
+                                if len(long_indices) < long_range_frames:
+                                    long_indices.append(i)
+                            
+                            context_indices.extend(long_indices[:long_range_frames])
+                        
+                        # Ensure we have exactly the needed context frames
+                        context_indices = sorted(list(set(context_indices)))
+                        
+                        if len(context_indices) > total_context_frames:
+                            context_indices = context_indices[-total_context_frames:]
+                        elif len(context_indices) < total_context_frames:
+                            recent_indices = list(range(max(0, available_frames - total_context_frames), available_frames))
+                            context_indices = sorted(list(set(context_indices + recent_indices)))[-total_context_frames:]
+                        
+                        # Gather context frames
+                        context_frames = torch.stack([all_generated_frames[i] for i in context_indices], dim=1)
+                        
+                        print(f"Context sampling - Total frames: {available_frames}, Selected indices: {context_indices}")
+                        
                     else:
-                        
-                        if len(all_generated_latents) == 2:
-                            recent_latent=all_generated_latents[-1]
-                            recent_context=recent_latent[:, -11:, :, :] 
-                            
-                            mid_latent=all_generated_latents[-2] 
-                            mid_indices = [20, 18, 16, 14,12,10,8,6,4,2]
-                            mid_context=mid_latent[:, mid_indices, :, :]
-                            contexts = torch.cat([recent_context, mid_context], dim=1)
-                            
-                            
+                        # Not enough frames for smart sampling, use what we have
+                        if all_generated_frames:
+                            context_frames = torch.stack(all_generated_frames, dim=1)
                         else:
-                            contexts=all_generated_latents[0]
-                           
-                    print('context','section:',section_idx,contexts.shape)      
-                    msk = torch.ones(1, 21, lat_h, lat_w, device=self.device)
-                    # No zeroing out since all frames are context
+                            context_frames = None
 
-                    # Since we need 84 total channels (21 frames * 4), repeat each frame 4 times
-                    msk = torch.repeat_interleave(msk, repeats=4, dim=1)  # Shape: (1, 84, lat_h, lat_w)
+                    # Initialize noise for ALL 21 frames (we'll condition on context during generation)
+                    # Use temporal coherence from previous frames
+                    if all_generated_frames:
+                        last_frames = all_generated_frames[-min(3, len(all_generated_frames)):]
+                        recent_frames = torch.stack(last_frames, dim=0)
+                        noise_std = recent_frames.std()
+                        noise_mean = recent_frames.mean()
+                    else:
+                        noise_std = 1.0
+                        noise_mean = 0.0
 
-                    # Reshape to group every 4 channels together
-                    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)  # Shape: (1, 21, 4, lat_h, lat_w)
+                    # Generate noise for full window
+                    section_noise = torch.randn(
+                        16, latent_window_size,  # Always 21 frames
+                        lat_h, lat_w,
+                        dtype=torch.float32,
+                        generator=seed_g,
+                        device=self.device)
 
-                    # Transpose to get (4, 21, lat_h, lat_w) and remove batch dim
-                    msk = msk.transpose(1, 2)[0]  # Shape: (4, 21, lat_h, lat_w)
+                    # Apply temporal coherence to noise
+                    blend_factor = min(0.2 + (section_idx * 0.05), 0.5)
+                    section_noise = section_noise * noise_std * (1 - blend_factor) + noise_mean * blend_factor
 
-                    msk = msk.to('cuda:3')
-                    contexts=contexts.to('cuda:3')
-                    y = torch.concat([msk, contexts])   
-                    msk = msk.to('cpu')
-                    contexts=contexts.to('cpu')
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    print('context concatnated','section:',section_idx,y.shape)      
-                    arg_c = {
-                        'context': [context[0]],
-                        'clip_fea': clip_context,
-                        'seq_len': max_seq_len,
-                        'y': [y],
-                    }
+                    latent = section_noise  # Shape: (16, 21, lat_h, lat_w)
 
-                    arg_null = {
-                        'context': context_null,
-                        'clip_fea': clip_context,
-                        'seq_len': max_seq_len,
-                        'y': [y],
-                    }
-                    inital= latent
-                    if offload_model:
-                        torch.cuda.empty_cache()
-                    print(f"Input latent stats:  std={latent.std().item():.4f}")
+                    # Create mask for this section
+                    section_msk = torch.ones(1, latent_window_size, lat_h, lat_w, device=self.device)
+                    section_msk = torch.repeat_interleave(section_msk, repeats=4, dim=1)
+                    section_msk = section_msk.view(1, section_msk.shape[1] // 4, 4, lat_h, lat_w)
+                    section_msk = section_msk.transpose(1, 2)[0]  # Shape: (4, 21, lat_h, lat_w)
 
-                    for step_idx, t in enumerate(tqdm(timesteps)):
-                        # Clear all GPU caches before each timestep
-                        torch.cuda.empty_cache()
-                        # Log step info
-                        print(f"\n{'='*60}")
-                        print(f"Step {step_idx + 1}/{len(timesteps)} - Timestep: {t.item() if hasattr(t, 'item') else t}")
-                        print(f"{'='*60}")
-                        latent_mean = latent.mean().item()
-                        latent_std = latent.std().item()
-                        latent_min = latent.min().item()
-                        latent_max = latent.max().item()
-                        print(f"Input latent stats: mean={latent_mean:.4f}, std={latent_std:.4f}, min={latent_min:.4f}, max={latent_max:.4f}")
+                    # Prepare y_section
+                    if context_frames is not None:
+                        # Concatenate context frames to y_section as additional conditioning
+                        # This is where you'd integrate context into your model's conditioning mechanism
+                        # The exact implementation depends on how your model handles context
                         
-
-                        # Start processing on GPU 0 (where embeddings are)
-                        latent_model_input = [latent.to(torch.device('cuda:0'))]
-                        print('latent/noise',latent.shape )
-                        timestep = [t]
-                        timestep = torch.stack(timestep).to(torch.device('cuda:0'))
+                        # Option 1: If your model expects context in y
+                        # Pad context to match latent dimensions if needed
+                        context_latent = torch.zeros_like(latent)
+                        context_latent[:, :context_frames.shape[1]] = context_frames
                         
-                        # Move arg_c to GPU 0 for initial processing (only what's needed)
-                        arg_c_gpu0 = {}
-                        for key, value in arg_c.items():
-                            if isinstance(value, torch.Tensor):
-                                arg_c_gpu0[key] = value.to(torch.device('cuda:0'))
-                            elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-                                arg_c_gpu0[key] = [v.to(torch.device('cuda:0')) for v in value]
-                            else:
-                                arg_c_gpu0[key] = value
-
-                        # Forward pass through distributed model - output will be on GPU 3
-                        noise_pred_cond = self.model(
-                            latent_model_input, t=timestep, **arg_c_gpu0)[0]
+                        # Create context mask
+                        context_msk = torch.zeros_like(section_msk)
+                        context_msk[:, :context_frames.shape[1]] = 1.0  # Mark which frames are context
                         
-                        # Immediately move to CPU to free GPU 3 memory
-                        noise_pred_cond = noise_pred_cond.to(torch.device('cpu'))
-                        cond_mean = noise_pred_cond.mean().item()
-                        cond_std = noise_pred_cond.std().item()
-                        print(f"Conditional noise pred: mean={cond_mean:.4f}, std={cond_std:.4f}")
-                        # Clear intermediate results and GPU caches
-                        del latent_model_input, arg_c_gpu0
-                        torch.cuda.empty_cache()
-                        
-                        # Second forward pass for unconditional - fresh start
-                        latent_model_input = [latent.to(torch.device('cuda:0'))]
-                        timestep = torch.stack([t]).to(torch.device('cuda:0'))
-                        
-                        arg_null_gpu0 = {}
-                        for key, value in arg_null.items():
-                            if isinstance(value, torch.Tensor):
-                                arg_null_gpu0[key] = value.to(torch.device('cuda:0'))
-                            elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-                                arg_null_gpu0[key] = [v.to(torch.device('cuda:0')) for v in value]
-                            else:
-                                arg_null_gpu0[key] = value
-                        
-                        noise_pred_uncond = self.model(
-                            latent_model_input, t=timestep, **arg_null_gpu0)[0]
-                        
-                        # Immediately move to CPU
-                        noise_pred_uncond = noise_pred_uncond.to(torch.device('cpu'))
-                        uncond_mean = noise_pred_uncond.mean().item()
-                        uncond_std = noise_pred_uncond.std().item()
-                        print(f"Unconditional noise pred: mean={uncond_mean:.4f}, std={uncond_std:.4f}")
-                        # Clear all intermediate results
-                        del latent_model_input, timestep, arg_null_gpu0
-                        torch.cuda.empty_cache()
-                        
-                        # Compute guidance on CPU to save GPU memory
-                        noise_pred = noise_pred_uncond + guide_scale * (
-                            noise_pred_cond - noise_pred_uncond)
-                        
-                        guidance_diff = (noise_pred_cond - noise_pred_uncond).abs().mean().item()
-                        print(f"Guidance effect magnitude: {guidance_diff:.4f}")
-                        print(f"Guidance scale: {guide_scale}")
-                        
-                        noise_mean = noise_pred.mean().item()
-                        noise_std = noise_pred.std().item()
-                        print(f"Final noise pred: mean={noise_mean:.4f}, std={noise_std:.4f}")
-                        # Move latent to CPU for scheduler step
-                        latent = latent.to(torch.device('cpu'))
-
-                        temp_x0 = sample_scheduler.step(
-                            noise_pred.unsqueeze(0),
-                            t,
-                            latent.unsqueeze(0),
-                            return_dict=False,
-                            generator=seed_g)[0]
-                        latent = temp_x0.squeeze(0)
-                        print(latent.shape,'section latent')
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        
-                        
-                        
-                    all_generated_latents.append(latent)
-                    del latent
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    
-            self.offload_model_to_cpu()   
+                        # Combine everything
+                        y_section = torch.concat([context_msk, context_latent])  # Shape: (4+16+4+16, 21, lat_h, lat_w)
+                    else:
+                        # No context, just use mask and latent
+                        y_section = torch.concat([section_msk, latent])  # Shape: (20, 21, lat_h, lat_w)
                 
-        # Combine all generated latents
-        final_latent = torch.cat(all_generated_latents, dim=1).to(torch.device('cuda:3'))
-        final_latent=final_latent.to(torch.device('cuda:3'))
-        # start_latent_expanded = start_latent.unsqueeze(0).unsqueeze(2).to('cuda:3')  # Shape: (1, 16, 1, H, W)
-        # final_latent = torch.cat([start_latent, final_latent], dim=1) 
-        # final_latent=final_latent.squeeze(0)
+                print(f"Generating {frames_to_generate} new frames with {overlap_frames if section_idx > 0 else 0} context frames")
+                print(y_section.shape, 'y shape')
+                print(latent.shape,'latent shape')
+                # Prepare arguments
+                arg_c = {
+                    'context': [context[0]],
+                    'clip_fea': clip_context,
+                    'seq_len': max_seq_len,
+                    'y': [y_section],
+                }
+
+                arg_null = {
+                    'context': context_null,
+                    'clip_fea': clip_context,
+                    'seq_len': max_seq_len,
+                    'y': [y_section],
+                }
+                
+                # Denoising loop
+                for step_idx, t in enumerate(tqdm(timesteps)):
+                    torch.cuda.empty_cache()
+                    
+                    # Conditional prediction
+                    latent_model_input = [latent.to(torch.device('cuda:0'))]
+                    timestep = torch.stack([t]).to(torch.device('cuda:0'))
+                    
+                    arg_c_gpu0 = {}
+                    for key, value in arg_c.items():
+                        if isinstance(value, torch.Tensor):
+                            arg_c_gpu0[key] = value.to(torch.device('cuda:0'))
+                        elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
+                            arg_c_gpu0[key] = [v.to(torch.device('cuda:0')) for v in value]
+                        else:
+                            arg_c_gpu0[key] = value
+
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c_gpu0)[0]
+                    noise_pred_cond = noise_pred_cond.to(torch.device('cpu'))
+                    
+                    del latent_model_input, arg_c_gpu0
+                    torch.cuda.empty_cache()
+                    
+                    # Unconditional prediction
+                    latent_model_input = [latent.to(torch.device('cuda:0'))]
+                    timestep = torch.stack([t]).to(torch.device('cuda:0'))
+                    
+                    arg_null_gpu0 = {}
+                    for key, value in arg_null.items():
+                        if isinstance(value, torch.Tensor):
+                            arg_null_gpu0[key] = value.to(torch.device('cuda:0'))
+                        elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
+                            arg_null_gpu0[key] = [v.to(torch.device('cuda:0')) for v in value]
+                        else:
+                            arg_null_gpu0[key] = value
+                    
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null_gpu0)[0]
+                    noise_pred_uncond = noise_pred_uncond.to(torch.device('cpu'))
+                    
+                    del latent_model_input, timestep, arg_null_gpu0
+                    torch.cuda.empty_cache()
+                    
+                    # Apply classifier-free guidance
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+                    
+                    # Key improvement: Apply temporal smoothing at section boundaries
+                    if section_idx > 0 and step_idx > len(timesteps) // 2:
+                        # Gradually blend predictions near boundaries
+                        blend_region = 4  # frames
+                        for i in range(min(blend_region, overlap_frames)):
+                            weight = i / blend_region
+                            noise_pred[:, i] = noise_pred[:, i] * weight + noise_pred_uncond[:, i] * (1 - weight)
+                    
+                    latent = latent.to(torch.device('cpu'))
+                    
+                    # Scheduler step
+                    temp_x0 = sample_scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    latent = temp_x0.squeeze(0)
+                    
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    
+                
+                if section_idx == 0:
+                    # First section: keep all frames
+                    new_frames = [latent[:, i] for i in range(latent.shape[1])]
+                    all_generated_frames.extend(new_frames)
+                else:
+                    # Subsequent sections: skip the overlap frames (they were already in our history)
+                    new_frames = [latent[:, overlap_frames + i] for i in range(latent.shape[1] - overlap_frames)]
+                    all_generated_frames.extend(new_frames)
+                
+                # Stop if we've generated enough frames
+                if len(all_generated_frames) >= total_frames:
+                    all_generated_frames = all_generated_frames[:total_frames]
+                    
+                
+                del latent
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                gc.collect()
+                
+        self.offload_model_to_cpu()
+        
+        # Combine all frames
+        final_latent = torch.stack(all_generated_frames, dim=1).to(torch.device('cuda:3'))
+        
+        # Optional: Apply post-processing temporal smoothing
+        final_latent = self._apply_temporal_smoothing(final_latent)
         
         # Decode the final video
         if self.rank == 0:
-            if offload_model:
-                videos = self.vae.decode([final_latent])
-            else:
-                videos = self.vae.decode([final_latent])
-        
-        # del final_latent, all_generated_latents
-        # gc.collect()
-        # torch.cuda.empty_cache()
-        
-        # if dist.is_initialized():
-        #     dist.barrier()
+            videos = self.vae.decode([final_latent])
         
         return videos[0] if self.rank == 0 else None
+
+
+    def _apply_temporal_smoothing(self, latent, window_size=3):
+        """Apply temporal smoothing to reduce flicker between frames."""
+        if window_size <= 1:
+            return latent
+        
+        smoothed = latent.clone()
+        _, num_frames, _, _ = latent.shape
+        
+        for i in range(1, num_frames - 1):
+            # Simple moving average
+            start = max(0, i - window_size // 2)
+            end = min(num_frames, i + window_size // 2 + 1)
+            smoothed[:, i] = latent[:, start:end].mean(dim=1)
+        
+        return smoothed
