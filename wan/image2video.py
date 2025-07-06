@@ -731,7 +731,7 @@ class WanI2V:
                     gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
-
+                    
                 if self.rank == 0:
                     if offload_model:
                         # Move final latent to GPU 3 where VAE is located
@@ -939,6 +939,28 @@ class WanI2V:
                         
                         
                         # all_generated_latents.append(section_latent)
+                    fade_len = 4  # or 6, depending on how much overlap you want
+
+                    if len(all_generated_latents) > 0:
+                        # get previous
+                        previous_latent = all_generated_latents[-1]
+                        # get fade parts
+                        prev_tail = previous_latent[:, -fade_len:, :, :]
+                        curr_head = latent[:, :fade_len, :, :]
+                        
+                        # linear alpha from 0 to 1
+                        alpha = torch.linspace(0, 1, fade_len, device=self.device).view(1, fade_len, 1, 1)
+                        
+                        # blend
+                        blended = (1 - alpha) * prev_tail + alpha * curr_head
+                        
+                        # replace:
+                        previous_latent[:, -fade_len:, :, :] = blended
+                        
+                        # store only non-overlapping part of new latent to avoid duplication
+                        latent = latent[:, fade_len:, :, :]
+                        
+                    # then store
                         
                     all_generated_latents.append(latent)
                     del latent
@@ -951,55 +973,88 @@ class WanI2V:
                    
                     
                 else:
-                    latent = noise
+                    previous_latent=all_generated_latents[-1]
+                    noise= noise.to('cpu')
+                    
+                    prev_frames = previous_latent.shape[1]  # e.g., 17
+
+                    start_idx = max(0, prev_frames - latent_window_size)
+
+                    prev_slice = previous_latent[:, start_idx:, :, :]  # this will have length <= latent_window_size
+
+                    # If prev_slice shorter than noise, pad it with zeros
+                    if prev_slice.shape[1] < latent_window_size:
+                        padding = torch.zeros(
+                            prev_slice.shape[0], latent_window_size - prev_slice.shape[1], prev_slice.shape[2], prev_slice.shape[3], 
+                            device=prev_slice.device, dtype=prev_slice.dtype)
+                        prev_slice = torch.cat([padding, prev_slice], dim=1)
+
+                    latent = 0.3 * prev_slice + 0.7 * noise
                     print('all generated',len(all_generated_latents))
                     if len(all_generated_latents) >= 3:
                         
                         recent_latent=all_generated_latents[-1]
-                        recent_context=recent_latent[:, -12:, :, :] 
+                        recent_context=recent_latent[:, -3:, :, :] 
                         
                         mid_latent=all_generated_latents[-2] 
-                        mid_indices = [20, 18, 16, 14,12,10]
+                        mid_indices = [17, 15, 13, 11]
                         mid_context=mid_latent[:, mid_indices, :, :]
-                        long_indices=[20,16,12]
+                        long_indices=[17,13,9,5,1]
                         long_latent=all_generated_latents[-3] 
                         long_context=long_latent[:, long_indices, :, :]
                         
                         
                         contexts = torch.cat([recent_context, mid_context, long_context], dim=1)
+                        latent_sequence = torch.concat([
+                            contexts,  # repeat 16 times
+                            torch.zeros(16, 9, lat_h, lat_w)  # 5 zeros
+                        ], dim=1)
                         
                     
                     else:
                         
                         if len(all_generated_latents) == 2:
                             recent_latent=all_generated_latents[-1]
-                            recent_context=recent_latent[:, -11:, :, :] 
+                            recent_context=recent_latent[:, -3:, :, :] 
                             
                             mid_latent=all_generated_latents[-2] 
-                            mid_indices = [20, 18, 16, 14,12,10,8,6,4,2]
+                            mid_indices = [17, 15, 13,11,9,7,5,3,1]
                             mid_context=mid_latent[:, mid_indices, :, :]
                             contexts = torch.cat([recent_context, mid_context], dim=1)
+                            latent_sequence = torch.concat([
+                            contexts,  # repeat 16 times
+                            torch.zeros(16, 9, lat_h, lat_w)  # 5 zeros
+                        ], dim=1)
+                        
                             
                             
                         else:
-                            contexts=all_generated_latents[0]
+                            context_latent=all_generated_latents[0]
+                            contexts=context_latent[:, -12:, :, :] 
+                        
+                            latent_sequence = torch.concat([
+                            contexts,  # repeat 16 times
+                            torch.zeros(16, 9, lat_h, lat_w)  # 5 zeros
+                        ], dim=1)
+                        
                            
                     print('context','section:',section_idx,contexts.shape)      
-                    msk = torch.ones(1, 21, lat_h, lat_w, device=self.device)
-                    # No zeroing out since all frames are context
-
-                    # Since we need 84 total channels (21 frames * 4), repeat each frame 4 times
-                    msk = torch.repeat_interleave(msk, repeats=4, dim=1)  # Shape: (1, 84, lat_h, lat_w)
-
-                    # Reshape to group every 4 channels together
-                    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)  # Shape: (1, 21, 4, lat_h, lat_w)
-
-                    # Transpose to get (4, 21, lat_h, lat_w) and remove batch dim
-                    msk = msk.transpose(1, 2)[0]  # Shape: (4, 21, lat_h, lat_w)
+                    msk = torch.zeros(1, 21, lat_h, lat_w, device=device)
+    
+                    # Mark context frames
+                    msk[:, :12] = 1
+                    
+                    # Expand to 4 channels per frame
+                    msk = msk.unsqueeze(2).expand(-1, -1, 4, -1, -1)  # (1, 21, 4, lat_h, lat_w)
+                    
+                    # Rearrange to (4, 21, lat_h, lat_w)
+                    msk = msk.permute(0, 2, 1, 3, 4).squeeze(0)
+                   
 
                     msk = msk.to('cuda:3')
-                    contexts=contexts.to('cuda:3')
-                    y = torch.concat([msk, contexts])   
+                    latent_sequence=latent_sequence.to('cuda:3')
+                    
+                    y = torch.concat([msk, latent_sequence])   
                     msk = msk.to('cpu')
                     contexts=contexts.to('cpu')
                     torch.cuda.empty_cache()
@@ -1117,8 +1172,32 @@ class WanI2V:
                         torch.cuda.empty_cache()
                         
                         
+                    fade_len = 4  # or 6, depending on how much overlap you want
+
+                    if len(all_generated_latents) > 0:
+                        # get previous
+                        previous_latent = all_generated_latents[-1]
+                        # get fade parts
+                        prev_tail = previous_latent[:, -fade_len:, :, :]
+                        curr_head = latent[:, :fade_len, :, :]
+                        prev_tail=prev_tail.to('cuda:0')
+                        curr_head=curr_head.to('cuda:0')
                         
-                    all_generated_latents.append(latent)
+                        # linear alpha from 0 to 1
+                        alpha = torch.linspace(0, 1, fade_len, device=self.device).view(1, fade_len, 1, 1)
+                        alpha=alpha.to('cuda:0')
+                        # blend
+                        blended = (1 - alpha) * prev_tail + alpha * curr_head
+                        
+                        # replace:
+                        previous_latent[:, -fade_len:, :, :] = blended
+                        
+                        # store only non-overlapping part of new latent to avoid duplication
+                        latent = latent[:, fade_len:, :, :]
+                        
+                    # then store
+                    all_generated_latents.append(latent)    
+                    
                     del latent
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
@@ -1126,6 +1205,8 @@ class WanI2V:
                     
             self.offload_model_to_cpu()   
                 
+                
+        
         # Combine all generated latents
         final_latent = torch.cat(all_generated_latents, dim=1).to(torch.device('cuda:3'))
         final_latent=final_latent.to(torch.device('cuda:3'))
