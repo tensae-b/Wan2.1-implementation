@@ -468,6 +468,7 @@ class WanI2V:
                                 offload_model,
                                 frames_per_section,
                                 overlap_frames)
+            return result
             
         else:
             img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
@@ -890,17 +891,7 @@ class WanI2V:
                 window_start = 0
                 
                 while window_start < total_latent_frames:
-                    if sample_solver == 'unipc':
-                        window_scheduler = FlowUniPCMultistepScheduler(
-                            num_train_timesteps=self.num_train_timesteps,
-                            shift=shift, use_dynamic_shifting=False)
-                        window_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
-                        # Set the current timestep index
-                        window_scheduler._step_index = step_idx
-                    else:
-                        window_scheduler = FlowDPMSolverMultistepScheduler(
-                            num_train_timesteps=self.num_train_timesteps,
-                            shift=shift, use_dynamic_shifting=False)
+                    
                     window_end = min(window_start + section_latent_frames, total_latent_frames)
                     window_frames = window_end - window_start
                     
@@ -993,56 +984,48 @@ class WanI2V:
                     # Apply guidance
                     noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
                     
-                    # Scheduler step for this window
-                    window_latent = window_latent.cpu()
-                    denoised_window = window_scheduler.step(
-                        noise_pred.unsqueeze(0), t, window_latent.unsqueeze(0),
-                        return_dict=False, generator=seed_g)[0].squeeze(0)
+                    window_weights = torch.ones_like(window_latent)
+                    if window_start > 0 and overlap_latent_frames > 0:
+                        # Fade in from left overlap
+                        fade_in = torch.linspace(0, 1, overlap_latent_frames, device=window_latent.device)
+                        fade_in = fade_in.view(1, -1, 1, 1).expand_as(window_latent[:, :overlap_latent_frames])
+                        window_weights[:, :overlap_latent_frames] *= fade_in
                     
-                    # Blend the denoised window back into the full latent
-                    if window_start == 0:
-                        # First window - just copy
-                        updated_latent[:, window_start:window_end] = denoised_window
-                    else:
-                        # Overlapping windows - blend in the overlap region
-                        overlap_start = window_start
-                        overlap_end = min(window_start + overlap_latent_frames, window_end)
-                        
-                        if overlap_end > overlap_start:
-                            # Create blending weights
-                            overlap_size = overlap_end - overlap_start
-                            weights = torch.linspace(0, 1, overlap_size, device=denoised_window.device)
-                            weights = weights.view(1, -1, 1, 1)
-                            
-                            # Blend overlap region
-                            overlap_old = updated_latent[:, overlap_start:overlap_end]
-                            overlap_new = denoised_window[:, :overlap_size]
-                            updated_latent[:, overlap_start:overlap_end] = (
-                                (1 - weights) * overlap_old + weights * overlap_new
-                            )
-                            
-                            # Copy non-overlap region
-                            if overlap_end < window_end:
-                                updated_latent[:, overlap_end:window_end] = denoised_window[:, overlap_size:]
-                        else:
-                            # No overlap, just copy
-                            updated_latent[:, window_start:window_end] = denoised_window
+                    if window_end < total_latent_frames and overlap_latent_frames > 0:
+                        # Fade out to right overlap
+                        fade_out = torch.linspace(1, 0, overlap_latent_frames, device=window_latent.device)
+                        fade_out = fade_out.view(1, -1, 1, 1).expand_as(window_latent[:, -overlap_latent_frames:])
+                        window_weights[:, -overlap_latent_frames:] *= fade_out
+                    
+                    # Accumulate weighted noise predictions
+                    full_noise_pred[:, window_start:window_end] += noise_pred.cpu() * window_weights.cpu()
+                    full_weight_mask[:, window_start:window_end] += window_weights.cpu()
+                    
+                    # Move to next window
+                    window_start += section_latent_frames - overlap_latent_frames
+                    
+                    # Clean up
+                    del window_latent, noise_pred, noise_pred_cond, noise_pred_uncond
+                    torch.cuda.empty_cache()
                     
                     # Move to next window with overlap
                     window_start += section_latent_frames - overlap_latent_frames
                     
-                    # Clean up
-                    del window_latent, denoised_window, noise_pred, noise_pred_cond, noise_pred_uncond, y, msk
+                   
                     torch.cuda.empty_cache()
                 
                 # Update the full latent for next timestep
-                full_latent = updated_latent
+                full_noise_pred = full_noise_pred / (full_weight_mask + 1e-8)
+    
+                # Now do a single scheduler step with the full blended noise prediction
+                full_latent = sample_scheduler.step(
+                    full_noise_pred.unsqueeze(0), t, full_latent.unsqueeze(0),
+                    return_dict=False, generator=seed_g)[0].squeeze(0)
                 
                 # Optional: save intermediate results
                 if step_idx % 10 == 0:
                     print(f"Latent stats at step {step_idx}: mean={full_latent.mean():.4f}, std={full_latent.std():.4f}")
-                if step_idx == 12:
-                    break
+                
             # Final latent is ready
             print("\nDenoising complete!")
             
@@ -1051,24 +1034,26 @@ class WanI2V:
                         # Decode in chunks to save memory
             final_latent = full_latent.to(torch.device('cuda:3'))
             chunk_size = 25  # Adjust based on available memory
+            print('final latent shape',final_latent.shape)
+            video = self.vae.decode([final_latent])[0]
             
-            if final_latent.shape[1] > chunk_size:
-                print("Decoding video in chunks...")
-                videos = []
-                for i in range(0, final_latent.shape[1], chunk_size):
-                    chunk = final_latent[:, i:i+chunk_size]
-                    video_chunk = self.vae.decode([chunk])[0].cpu()
-                    videos.append(video_chunk)
-                    torch.cuda.empty_cache()
+            # if final_latent.shape[1] > chunk_size:
+            #     print("Decoding video in chunks...")
+            #     videos = []
+            #     for i in range(0, final_latent.shape[1], chunk_size):
+            #         chunk = final_latent[:, i:i+chunk_size]
+            #         video_chunk = self.vae.decode([chunk])[0].cpu()
+            #         videos.append(video_chunk)
+            #         torch.cuda.empty_cache()
                 
-                final_video = torch.cat(videos, dim=1)
-            else:
-                final_video = self.vae.decode([final_latent])[0]
+            #     final_video = torch.cat(videos, dim=1)
+            # else:
+            #     final_video = self.vae.decode([final_latent])[0]
             
             # # Trim to exact frame count
             # final_video = final_video[:, :total_frames]
             
             # return final_video
-            return final_video[0] if self.rank == 0 else None
+            return video[0] if self.rank == 0 else None
             
            
