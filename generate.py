@@ -382,6 +382,8 @@ def generate(args):
             offload_model=args.offload_model)
 
     elif "i2v" in args.task:
+        
+        
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
         if args.image is None:
