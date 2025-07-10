@@ -775,7 +775,7 @@ class WanI2V:
         # Calculate total frames and sections
         latent_window_size = 21
         total_frames = 42
-        
+        global_frame_position = 0 
         
         # Fixed context window size (e.g., 12 frames of context + 9 frames to generate)
         # This matches the official code's multi-scale context: 1 + 2 + 16 ≈ 12 effective context frames
@@ -820,6 +820,7 @@ class WanI2V:
                     generator=rng,
                     device=device
                 )
+                    frame_offset = 0
                     print(section_noise.shape,'section_noise section1, shape')
                     latent_sequence = start_latent
                     print(latent_sequence.shape,'latent_sequence section 1, shape')
@@ -846,11 +847,14 @@ class WanI2V:
                     generator=rng,
                     device=device
                 )
+                    generation_window_size=21
+                    frame_offset = section_idx * generation_window_size
                     # Subsequent sections: use frames from previous generations as context
                    
                     context_frames = self._get_fixed_context_window(
                         all_generated_frames, context_window_size, lat_h, lat_w
                     )
+                    context_frames=context_frames[:, -1:, :, :] 
                     # context_frames=all_generated_frames[-1] 
                     context_frames=context_frames.to("cuda:3")
                     print('context frames shape:', context_frames.shape)
@@ -966,17 +970,18 @@ class WanI2V:
                                                 #decoding context
                     ###############################################################################################
                     print('context frames',context_frames.shape )
-                    generation_window_size=9
-                    # Combine context + zeros for generation
-                    context_frames= context_frames.to('cuda:0')
-                    zeros_for_generation = torch.zeros(16, generation_window_size, lat_h, lat_w, device=device)
-                    latent_sequence = torch.cat([context_frames, zeros_for_generation], dim=1)
+                    # generation_window_size=21
+                    # # Combine context + zeros for generation
+                    # context_frames= context_frames.to('cuda:0')
+                    # zeros_for_generation = torch.zeros(16, 20, lat_h, lat_w, device=device)
+                    # latent_sequence = torch.cat([context_frames, zeros_for_generation], dim=1)
+                    latent_sequence=start_latent
                     print('latent_sequence',latent_sequence.shape )
                     # Create mask: 1 for context, 0 for generation
-                    msk = torch.ones(1, 48, lat_h, lat_w, device=self.device)
-                    msk[:, 12:] = 0
+                    msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
+                    msk[:, 1:] = 0
                     msk = torch.concat([
-                        torch.repeat_interleave(msk[:, 0:12], repeats=4, dim=1), msk[:, 12:]
+                        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
                     ],
                                     dim=1)
                     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
@@ -1002,6 +1007,7 @@ class WanI2V:
                     'clip_fea': clip_context,
                     'seq_len': max_seq_len,
                     'y': [y_section],
+                    'frame_offset': frame_offset
                 }
 
                 arg_null = {
@@ -1009,6 +1015,7 @@ class WanI2V:
                     'clip_fea': clip_context,
                     'seq_len': max_seq_len,
                     'y': [y_section],
+                    'frame_offset': frame_offset
                 }
                 
                 shift= 1.0
@@ -1049,6 +1056,7 @@ class WanI2V:
                     
                     
                     gc.collect()
+                    
                     
                 
                 # Store generated frames
