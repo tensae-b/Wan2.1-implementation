@@ -39,35 +39,61 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
+
 @amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs, frame_offset=0):
+    """Apply RoPE with global frame offset for sliding windows"""
     n, c = x.size(2), x.size(3) // 2
-
-    # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
+    
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
-
-        # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
+        
+        # KEY CHANGE: Use global frame positions
+        global_frame_positions = torch.arange(f, device=x.device) + frame_offset
+        
         freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[0][global_frame_positions].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
+        ], dim=-1).reshape(seq_len, 1, -1)
+        
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
         output.append(x_i)
+    
     return torch.stack(output).float()
+# def rope_apply(x, grid_sizes, freqs):
+#     n, c = x.size(2), x.size(3) // 2
+
+#     # split freqs
+#     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+#     # loop over samples
+#     output = []
+#     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+#         seq_len = f * h * w
+
+#         # precompute multipliers
+#         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+#             seq_len, n, -1, 2))
+#         freqs_i = torch.cat([
+#             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+#             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+#             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+#         ],
+#                             dim=-1).reshape(seq_len, 1, -1)
+
+#         # apply rotary embedding
+#         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+#         x_i = torch.cat([x_i, x[i, seq_len:]])
+
+#         # append to collection
+#         output.append(x_i)
+#     return torch.stack(output).float()
 
 
 class WanRMSNorm(nn.Module):
@@ -127,7 +153,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, frame_offset=0):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -147,8 +173,8 @@ class WanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=rope_apply(q, grid_sizes, freqs,frame_offset),
+            k=rope_apply(k, grid_sizes, freqs,frame_offset),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -284,6 +310,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        frame_offset=0
     ):
         r"""
         Args:
@@ -301,7 +328,7 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs, frame_offset)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -500,6 +527,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        frame_offset=0
     ):
         r"""
         Forward pass through the diffusion model
@@ -571,7 +599,8 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            frame_offset=frame_offset)
 
         for block in self.blocks:
             x = block(x, **kwargs)

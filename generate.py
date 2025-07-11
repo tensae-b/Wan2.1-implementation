@@ -20,6 +20,7 @@ from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
 
 
+
 EXAMPLE_PROMPT = {
     "t2v-1.3B": {
         "prompt":
@@ -424,6 +425,18 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        
+        # wan_i2v = wan.WanI2V(
+        #     config=cfg,
+        #     checkpoint_dir=args.ckpt_dir,
+        #     quantized_model_dir='/home/comfy/projects/framepack-wan/Wan2.1/quantized/',
+        #     device_id=device,
+        #     rank=rank,
+        #     t5_fsdp=args.t5_fsdp,
+        #     dit_fsdp=args.dit_fsdp,
+        #     use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+        #     t5_cpu=args.t5_cpu,
+        # )
 
         logging.info("Generating video ...")
         video = wan_i2v.generate(

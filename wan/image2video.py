@@ -70,6 +70,7 @@ class WanI2V:
         """
         block_num=40
         first_block=8
+        
         def block_distributed_forward(self, x, t=None, context=None, seq_len=None, clip_fea=None, y=None, **other_kwargs):
             """
             Distributed forward pass that moves data through GPUs sequentiallyS
@@ -403,7 +404,7 @@ class WanI2V:
     def generate(self,
                  input_prompt,
                  img,
-                 max_area=240 * 416,  # Reduced from 480 * 832
+                 max_area=120 * 208,  # Reduced from 480 * 832
                  frame_num=5,  # Reduced from 4  
                  shift=3.0,  # Reduced from 5.0 for smaller resolution
                  sample_solver='unipc',
@@ -412,42 +413,7 @@ class WanI2V:
                  n_prompt="blurry, unclear",
                  seed=-1,
                  offload_model=True):
-        r"""
-        Generates video frames from input image and text prompt using diffusion process.
-
-        Args:
-            input_prompt (`str`):
-                Text prompt for content generation.
-            img (PIL.Image.Image):
-                Input image tensor. Shape: [3, H, W]
-            max_area (`int`, *optional*, defaults to 720*1280):
-                Maximum pixel area for latent space calculation. Controls video resolution scaling
-            frame_num (`int`, *optional*, defaults to 81):
-                How many frames to sample from a video. The number should be 4n+1
-            shift (`float`, *optional*, defaults to 5.0):
-                Noise schedule shift parameter. Affects temporal dynamics
-                [NOTE]: If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
-            sample_solver (`str`, *optional*, defaults to 'unipc'):
-                Solver used to sample the video.
-            sampling_steps (`int`, *optional*, defaults to 40):
-                Number of diffusion sampling steps. Higher values improve quality but slow generation
-            guide_scale (`float`, *optional*, defaults 5.0):
-                Classifier-free guidance scale. Controls prompt adherence vs. creativity
-            n_prompt (`str`, *optional*, defaults to ""):
-                Negative prompt for content exclusion. If not given, use `config.sample_neg_prompt`
-            seed (`int`, *optional*, defaults to -1):
-                Random seed for noise generation. If -1, use random seed
-            offload_model (`bool`, *optional*, defaults to True):
-                If True, offloads models to CPU during generation to save VRAM
-
-        Returns:
-            torch.Tensor:
-                Generated video frames tensor. Dimensions: (C, N H, W) where:
-                - C: Color channels (3 for RGB)
-                - N: Number of frames (81)
-                - H: Frame height (from max_area)
-                - W: Frame width from max_area)
-        """
+       
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         F = frame_num
@@ -770,8 +736,8 @@ class WanI2V:
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-        sampling_steps = 40
-        
+        sampling_steps = 20
+        sample_solve='dpm++'
         # Calculate total frames and sections
         latent_window_size = 21
         total_frames = 42
@@ -814,6 +780,7 @@ class WanI2V:
                
                     
                 if section_idx == 0:
+                    frame_offset = 0
                     section_noise = torch.randn(
                     16, 21, lat_h, lat_w,
                     dtype=torch.float32,
@@ -840,6 +807,7 @@ class WanI2V:
                     latent_sequence=latent_sequence.to('cuda:3')
                     
                 else:
+                    frame_offset = section_idx * 21
                     section_noise = torch.randn(
                     16, 21, lat_h, lat_w,
                     dtype=torch.float32,
@@ -851,7 +819,7 @@ class WanI2V:
                     context_frames = self._get_fixed_context_window(
                         all_generated_frames, context_window_size, lat_h, lat_w
                     )
-                    # context_frames=all_generated_frames[-1] 
+                    context_frames=all_generated_frames[-1] 
                     context_frames=context_frames.to("cuda:3")
                     print('context frames shape:', context_frames.shape)
                     ###############################################################################################
@@ -884,7 +852,7 @@ class WanI2V:
                                 
                                 # Process the decoded frame
                                 video = decoded_video[0]  # Get the video tensor
-                                
+                                to_encode=video
                                 # Handle different possible shapes
                                 if video.dim() == 5:  # [B, C, F, H, W]
                                     decoded = video.squeeze(0)  # Remove batch -> [C, F, H, W]
@@ -945,7 +913,7 @@ class WanI2V:
                                 else:
                                     print(f'Unexpected decoded shape: {decoded_np.shape}')
                                     continue
-                                
+                                break
                                 # Save the frame
                                 filename = f"context_frames/frame_{frame_idx:02d}.png"
                                 imageio.imwrite(filename, decoded_np)
@@ -965,18 +933,29 @@ class WanI2V:
                     ###############################################################################################
                                                 #decoding context
                     ###############################################################################################
-                    print('context frames',context_frames.shape )
+                    if to_encode.min() >= 0:
+                        to_encode = to_encode * 2.0 - 1.0
+                    encoded_list = self.vae.encode([to_encode])
+                    re_encoded = encoded_list[0]
+                    
+                    # Extract first frame if multiple frames returned
+                    if re_encoded.shape[1] > 1:
+                        re_encoded = re_encoded[:, 0:1, :, :]
+                
+                    print('context frames',re_encoded.shape )
                     generation_window_size=9
                     # Combine context + zeros for generation
-                    context_frames= context_frames.to('cuda:0')
-                    zeros_for_generation = torch.zeros(16, generation_window_size, lat_h, lat_w, device=device)
-                    latent_sequence = torch.cat([context_frames, zeros_for_generation], dim=1)
+                    # context_frames= context_frames.to('cuda:0')
+                    # zeros_for_generation = torch.zeros(16, 20, lat_h, lat_w, device=device)
+                    # re_encoded=re_encoded.to('cuda:0')
+                    # latent_sequence = torch.cat([re_encoded, zeros_for_generation], dim=1)
+                    latent_sequence = start_latent
                     print('latent_sequence',latent_sequence.shape )
                     # Create mask: 1 for context, 0 for generation
-                    msk = torch.ones(1, 48, lat_h, lat_w, device=self.device)
-                    msk[:, 12:] = 0
+                    msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
+                    msk[:, 1:] = 0
                     msk = torch.concat([
-                        torch.repeat_interleave(msk[:, 0:12], repeats=4, dim=1), msk[:, 12:]
+                        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
                     ],
                                     dim=1)
                     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
@@ -1002,6 +981,7 @@ class WanI2V:
                     'clip_fea': clip_context,
                     'seq_len': max_seq_len,
                     'y': [y_section],
+                    'frame_offset': frame_offset
                 }
 
                 arg_null = {
@@ -1009,6 +989,7 @@ class WanI2V:
                     'clip_fea': clip_context,
                     'seq_len': max_seq_len,
                     'y': [y_section],
+                    'frame_offset': frame_offset
                 }
                 
                 shift= 1.0
@@ -1049,6 +1030,8 @@ class WanI2V:
                     
                     
                     gc.collect()
+            
+                    
                     
                 
                 # Store generated frames
