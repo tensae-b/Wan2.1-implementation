@@ -30,13 +30,12 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .modules.model import sinusoidal_embedding_1d
 
-
 class WanI2V:
 
     def __init__(
         self,
         config,
-        checkpoint_dir,  # Base directory with VAE, T5, CLIP
+        checkpoint_dir,
         device_id=0,
         rank=0,
         t5_fsdp=False,
@@ -44,26 +43,26 @@ class WanI2V:
         use_usp=False,
         t5_cpu=False,
         init_on_cpu=True,
-        quantized_model_dir=None,  # Separate directory for quantized model
+        quantized_model_dir=None,
     ):
         
         # Determine if using quantized model
         self.use_quantized = quantized_model_dir is not None
         
         block_num = 40
-        first_block = 13
         
-        # Your existing block_distributed_forward function with mixed precision support
+        # Modified block_distributed_forward to use GPUs 1,2,3
         def block_distributed_forward(self, x, t=None, context=None, seq_len=None, clip_fea=None, y=None, **other_kwargs):
-            num_gpus = 3
+            num_gpus = 3  # Using 3 GPUs
+            gpu_devices = [0, 1, 2]  # Skip GPU 0
             total_blocks = len(self.blocks)
             
             blocks_to_process = min(block_num, total_blocks)
-            first_gpu_blocks = first_block
-            remaining_blocks = blocks_to_process - first_gpu_blocks
-            blocks_per_other_gpu = remaining_blocks // 3
-            remainder = remaining_blocks % 3
+            # Divide blocks evenly among 3 GPUs
+            blocks_per_gpu = blocks_to_process // num_gpus
+            remainder = blocks_to_process % num_gpus
             
+            # Start processing on GPU 1
             device = self.patch_embedding.weight.device
             torch.cuda.empty_cache()
             
@@ -74,11 +73,10 @@ class WanI2V:
                 x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
             # Use float16 for quantized models
-            compute_dtype = torch.float16 if self.use_quantized else torch.float32
+            compute_dtype = torch.float16 
 
-            # Process with appropriate dtype
+            # Process embeddings
             with amp.autocast(dtype=compute_dtype):
-                # embeddings
                 x_embedded = []
                 for i, x_chunk in enumerate(x):
                     x_emb = self.patch_embedding(x_chunk.unsqueeze(0))
@@ -101,7 +99,7 @@ class WanI2V:
             del x_embedded
             torch.cuda.empty_cache()
 
-            # time embeddings
+            # Time embeddings
             with amp.autocast(dtype=torch.float32):
                 e = self.time_embedding(
                     sinusoidal_embedding_1d(self.freq_dim, t).float())
@@ -109,7 +107,7 @@ class WanI2V:
             
             torch.cuda.empty_cache()
 
-            # context processing
+            # Context processing
             with amp.autocast(dtype=compute_dtype):
                 context_lens = None
                 context_processed = self.text_embedding(
@@ -132,12 +130,12 @@ class WanI2V:
                 freqs=self.freqs,
                 context=context_processed,
                 context_lens=context_lens)
-            visible_devices = list(map(int, os.environ["CUDA_VISIBLE_DEVICES"].split(",")))
-            # Process blocks with mixed precision
-            for gpu_id in range(visible_devices):
-                logical_id = gpu_id  # 0, 1, 2
-                target_device = torch.device(f'cuda:{logical_id}')
+
+            # Process blocks on GPUs 1, 2, 3
+            for idx, gpu_id in enumerate(gpu_devices):
+                target_device = torch.device(f'cuda:{gpu_id}')
                 
+                # Move data to target GPU
                 if isinstance(x, list):
                     x = [tensor.to(target_device) for tensor in x]
                 else:
@@ -152,20 +150,13 @@ class WanI2V:
                     else:
                         local_kwargs[key] = value
                 
-                if gpu_id == 0:
-                    start_block = 0
-                    end_block = min(first_gpu_blocks, blocks_to_process)
-                else:
-                    start_block = first_gpu_blocks + (gpu_id - 1) * blocks_per_other_gpu
-                    if gpu_id <= remainder:
-                        start_block += (gpu_id - 1)
-                        end_block = min(start_block + blocks_per_other_gpu + 1, blocks_to_process)
-                    else:
-                        start_block += remainder
-                        end_block = min(start_block + blocks_per_other_gpu, blocks_to_process)
+                # Calculate block range for this GPU
+                start_block = idx * blocks_per_gpu + min(idx, remainder)
+                end_block = start_block + blocks_per_gpu + (1 if idx < remainder else 0)
                 
                 print(f"[block_distributed_forward] Processing blocks {start_block} to {end_block-1} on cuda:{gpu_id}")
                 
+                # Process blocks assigned to this GPU
                 for block_idx in range(start_block, end_block):
                     try:
                         with amp.autocast(dtype=compute_dtype):
@@ -177,13 +168,14 @@ class WanI2V:
                         with amp.autocast(dtype=compute_dtype):
                             x = self.blocks[block_idx](x, **local_kwargs)
                     
-                    if gpu_id == 0:
+                    # Clear cache periodically
+                    if block_idx % 5 == 0:
                         torch.cuda.empty_cache()
                 
                 del local_kwargs
             
-            # Final processing
-            final_device = torch.device(f'cuda:{num_gpus-1}')
+            # Final processing on GPU 3
+            final_device = torch.device('cuda:2')
             if isinstance(x, list):
                 x = [tensor.to(final_device) for tensor in x]
             else:
@@ -204,8 +196,8 @@ class WanI2V:
             
             return x
 
-        # Initialize base attributes
-        self.device = torch.device(f"cuda:{device_id}")
+        # Initialize on GPU 1 instead of GPU 0
+        self.device = torch.device(f"cuda:0")
         self.config = config
         self.rank = rank
         self.use_usp = use_usp
@@ -216,7 +208,7 @@ class WanI2V:
 
         shard_fn = partial(shard_model, device_id=device_id)
         
-        # Load T5 encoder from base checkpoint directory
+        # Load encoders
         print(f"Loading T5 encoder from {checkpoint_dir}")
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -230,35 +222,32 @@ class WanI2V:
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         
-        # Load VAE from base checkpoint directory
+        # VAE on GPU 3
         print(f"Loading VAE from {checkpoint_dir}")
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=torch.device('cuda:2'))
 
-        # Load CLIP from base checkpoint directory
+        # CLIP on GPU 1
         print(f"Loading CLIP from {checkpoint_dir}")
         self.clip = CLIPModel(
             dtype=torch.float16 if self.use_quantized else config.clip_dtype,
-            device=self.device,
+            device=torch.device('cuda:1'),
             checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
-        # Load the main model - either quantized or regular
+        # Load model (quantized or regular)
         if self.use_quantized:
             print(f"Loading INT8 quantized model from {quantized_model_dir}")
             logging.info(f"Creating quantized WanModel from {quantized_model_dir}")
             
-            # Check if the quantized directory has the full model or just the weights
             if os.path.exists(os.path.join(quantized_model_dir, "config.json")):
-                # Full model checkpoint
                 self.model = WanModel.from_pretrained(
                     quantized_model_dir,
                     torch_dtype=torch.float16,
                     low_cpu_mem_usage=True
                 )
             else:
-                # Just weights - need to load architecture from base checkpoint first
                 print("Loading model architecture from base checkpoint...")
                 self.model = WanModel.from_pretrained(
                     checkpoint_dir,
@@ -266,11 +255,9 @@ class WanI2V:
                     low_cpu_mem_usage=True
                 )
                 
-                # Then load quantized weights from safetensors
                 print("Loading quantized weights from safetensors...")
                 from safetensors.torch import load_file
                 
-                # Find the safetensors file
                 safetensor_files = [f for f in os.listdir(quantized_model_dir) if f.endswith('.safetensors')]
                 if not safetensor_files:
                     raise ValueError(f"No .safetensors file found in {quantized_model_dir}")
@@ -278,10 +265,7 @@ class WanI2V:
                 safetensor_path = os.path.join(quantized_model_dir, safetensor_files[0])
                 print(f"Loading from {safetensor_path}")
                 
-                # Load the safetensors file
                 quantized_state_dict = load_file(safetensor_path, device='cpu')
-                
-                # Load the state dict into the model
                 self.model.load_state_dict(quantized_state_dict, strict=True)
                 del quantized_state_dict
             
@@ -296,31 +280,26 @@ class WanI2V:
         self.model.eval().requires_grad_(False)
         self.sp_size = 1
 
-        # Continue with model distribution
+        # Distribute model blocks evenly across GPUs 1, 2, 3
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
-            if device_id == 0:
+            if device_id == 0:  # Only setup distribution once
                 num_gpus = 3
+                gpu_devices = [0,1, 2]
                 total_blocks = len(self.model.blocks)
                 blocks_to_process = min(block_num, total_blocks)
-                first_gpu_blocks = first_block
-                remaining_blocks = blocks_to_process - first_gpu_blocks
-                blocks_per_other_gpu = remaining_blocks // 3
-                remainder = remaining_blocks % 3
                 
-                for gpu_id in range(num_gpus):
-                    if gpu_id == 0:
-                        start_block = 0
-                        end_block = min(first_gpu_blocks, blocks_to_process)
-                    else:
-                        start_block = first_gpu_blocks + (gpu_id - 1) * blocks_per_other_gpu
-                        if gpu_id <= remainder:
-                            start_block += (gpu_id - 1)
-                            end_block = min(start_block + blocks_per_other_gpu + 1, blocks_to_process)
-                        else:
-                            start_block += remainder
-                            end_block = min(start_block + blocks_per_other_gpu, blocks_to_process)
+                # Calculate even distribution
+                blocks_per_gpu = blocks_to_process // num_gpus
+                remainder = blocks_to_process % num_gpus
+                
+                print(f"Distributing {blocks_to_process} blocks across GPUs {gpu_devices}")
+                
+                # Distribute blocks
+                for idx, gpu_id in enumerate(gpu_devices):
+                    start_block = idx * blocks_per_gpu + min(idx, remainder)
+                    end_block = start_block + blocks_per_gpu + (1 if idx < remainder else 0)
                     
                     target_device = torch.device(f'cuda:{gpu_id}')
                     for block_idx in range(start_block, end_block):
@@ -328,8 +307,11 @@ class WanI2V:
                     
                     print(f"GPU {gpu_id}: blocks {start_block}-{end_block-1} ({end_block-start_block} blocks)")
                 
+                # Replace forward method
                 self.model.forward = types.MethodType(block_distributed_forward, self.model)
                 
+                # Move model components
+                # Embeddings and initial layers on GPU 1
                 if hasattr(self.model, 'patch_embedding'):
                     self.model.patch_embedding.to(torch.device('cuda:0'))
                 if hasattr(self.model, 'time_embedding'):
@@ -340,6 +322,8 @@ class WanI2V:
                     self.model.text_embedding.to(torch.device('cuda:0'))
                 if hasattr(self.model, 'img_emb'):
                     self.model.img_emb.to(torch.device('cuda:0'))
+                
+                # Head on GPU 3 (with VAE)
                 if hasattr(self.model, 'head'):
                     self.model.head.to(torch.device('cuda:2'))
                     
@@ -405,10 +389,10 @@ class WanI2V:
                  img,
                  max_area=120 * 208,  # Reduced from 480 * 832
                  frame_num=5,  # Reduced from 4  
-                 shift=3.0,  # Reduced from 5.0 for smaller resolution
+                 shift=4.0,  # Reduced from 5.0 for smaller resolution
                  sample_solver='unipc',
                  sampling_steps=20,  # Reduced from 40
-                 guide_scale=5.0,
+                 guide_scale=6.5,
                  n_prompt="blurry, unclear",
                  seed=-1,
                  offload_model=True):
@@ -450,8 +434,8 @@ class WanI2V:
 
         print('text encoding')
         # preprocess
-        text_encoder_device = torch.device('cuda:3')
-        text_device= torch.device('cpu')
+        text_encoder_device = torch.device('cuda:2')
+        text_device= torch.device('cuda:0')
         
         if not self.t5_cpu:
             self.text_encoder.model.to(text_device)
@@ -460,22 +444,21 @@ class WanI2V:
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            context = self.text_encoder([input_prompt], torch.device('cuda:0'))
+            context_null = self.text_encoder([n_prompt], torch.device('cuda:0'))
+            context = [t.to(text_device) for t in context]
+            context_null = [t.to(text_device) for t in context_null]
         
         self.text_encoder.model.to('cpu')
         print('text encoding done')
         torch.cuda.empty_cache()
         gc.collect()
-
+       
         torch.cuda.synchronize()
-        self.clip.model.to(text_encoder_device)
-        img = img.to(text_encoder_device)
+        self.clip.model.to('cuda:2')
+        img = img.to('cuda:2')
         clip_context = self.clip.visual([img[:, None, :, :]])
         self.clip.model.cpu()
-        
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -488,9 +471,9 @@ class WanI2V:
                  torch.nn.functional.interpolate(
           img[None], size=(h, w), mode='bicubic').transpose(
               0, 1),
-                 torch.zeros(3, F - 1, h, w, device=text_encoder_device)
+                 torch.zeros(3, F - 1, h, w, device='cuda:2')
              ],
-              dim=1).to(text_encoder_device)
+              dim=1).to('cuda:2')
          ])[0]
         
         msk = msk.to(text_encoder_device)
@@ -509,8 +492,8 @@ class WanI2V:
         def noop_no_sync():
             yield
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-        sampling_steps = 10
-        sample_solver='dpm++'
+        sampling_steps = 25
+        sample_solver = 'dpm++'
         # Calculate total frames and sections
         latent_window_size = 21
         total_frames = 42
@@ -544,18 +527,7 @@ class WanI2V:
         else:
             rng.manual_seed(42)
         
-        if sample_solver == 'unipc':
-            sample_scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=self.num_train_timesteps,
-            shift=shift, use_dynamic_shifting=False)
-            sample_scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
-            timesteps = sample_scheduler.timesteps
-        elif sample_solver == 'dpm++':
-            sample_scheduler = FlowDPMSolverMultistepScheduler(
-            num_train_timesteps=self.num_train_timesteps,
-            shift=shift, use_dynamic_shifting=False)
-            sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-            timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=sampling_sigmas)
+        
                 
 
                 # Initialize scheduler
@@ -571,7 +543,26 @@ class WanI2V:
                 print(f'\nSection {section_idx + 1}/{total_sections}')
                 
                 # Generate fresh noise for generation window only
-                
+                if sample_solver == 'unipc':
+                    sample_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=shift,
+                        use_dynamic_shifting=False)
+                    sample_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
+                    timesteps = sample_scheduler.timesteps
+                elif sample_solver == 'dpm++':
+                    sample_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=shift,
+                        use_dynamic_shifting=False)
+                    sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                    timesteps, _ = retrieve_timesteps(
+                        sample_scheduler,
+                        device=self.device,
+                        sigmas=sampling_sigmas)
+                else:
+                    raise NotImplementedError("Unsupported solver.")
                
                     
                 if section_idx == 0:
@@ -598,8 +589,8 @@ class WanI2V:
                     print(msk_section.shape,'msk_section, shape')
                     # Initial latent is pure noise for generation window
                     latent = section_noise
-                    msk_section=msk_section.to('cuda:0')
-                    latent_sequence=latent_sequence.to('cuda:0')
+                    msk_section=msk_section.to('cuda:2')
+                    latent_sequence=latent_sequence.to('cuda:2')
                     quality_tracker['mean'] = start_latent.mean().item()
                     quality_tracker['std'] = start_latent.std().item()
                     quality_tracker['initialized'] = True
@@ -636,6 +627,7 @@ class WanI2V:
                         # Use last 3 frames for motion continuity
                         last_frames = torch.cat(all_generated_frames[-3:], dim=1)
                         motion_delta = last_frames[:, -1] - last_frames[:, -2]
+                        motion_delta=motion_delta.to('cuda:0')
                         
                         # Apply motion to noise for continuity
                         for i in range(3):
@@ -645,11 +637,11 @@ class WanI2V:
                     # Create latent sequence efficiently
                     zeros_for_generation = torch.zeros(
                         16, new_frames_to_generate, lat_h, lat_w, 
-                        device='cuda:0'  # Create directly on target device
+                        device='cuda:2'  # Create directly on target device
                     )
                     
                     # Move context frames directly to target device
-                    context_frames = context_frames.to('cuda:0')
+                    context_frames = context_frames.to('cuda:2')
                     
                     # Concatenate on target device (avoiding extra memory copy)
                     latent_sequence = torch.cat([context_frames, zeros_for_generation], dim=1)
@@ -660,7 +652,7 @@ class WanI2V:
                         new_frames_to_generate, 
                         lat_h, 
                         lat_w, 
-                        device='cuda:0'
+                        device='cuda:2'
                     )
                     
                     # Use only generation portion of noise
@@ -758,7 +750,7 @@ class WanI2V:
 
         # Combine all generated frames
         final_latent = self._combine_generated_frames(
-            all_generated_frames, start_latent, total_frames, device='cuda:0'
+            all_generated_frames, start_latent, total_frames, device='cuda:2'
         )
         
         # Decode the final video
@@ -999,7 +991,12 @@ class WanI2V:
     def _denoise_step_consistent(self, latent, t, arg_c, arg_null, guide_scale, scheduler, seed_g, step_idx, total_steps):
         """Denoise step for consistent y_section approach."""
         device = 'cuda:0'
-        
+          # For quantized models, add momentum to stabilize
+        if hasattr(self, '_prev_noise_pred') and self.use_quantized:
+            momentum = 0.3  # Smooth out predictions
+        else:
+            momentum = 0.0
+            self._prev_noise_pred = None
         # Move to processing device
         latent_input = [latent.to(device)]
         timestep = torch.tensor([t]).to(device)
@@ -1025,7 +1022,10 @@ class WanI2V:
         
         # Apply classifier-free guidance
         noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
-        
+        if self.use_quantized and self._prev_noise_pred is not None:
+            noise_pred = momentum * self._prev_noise_pred + (1 - momentum) * noise_pred
+            
+        self._prev_noise_pred = noise_pred.clone()
         # Scheduler step
         latent = latent.to('cpu')
         latent_next = scheduler.step(
@@ -1182,3 +1182,37 @@ class WanI2V:
         # Normalize and return
         motion_accum = motion_accum / (len(recent_frames) - 1)
         return motion_accum.to(device)
+    def _preserve_latent_quality(self, latent, quality_tracker, strength=0.2):
+        """Preserve latent quality to prevent degradation."""
+        current_mean = latent.mean()
+        current_std = latent.std()
+        
+        # Only apply if distribution has drifted
+        mean_diff = abs(current_mean.item() - quality_tracker['mean'])
+        std_diff = abs(current_std.item() - quality_tracker['std'])
+        
+        if mean_diff > 0.5 or std_diff > 0.5:
+            # Normalize
+            normalized = (latent - current_mean) / (current_std + 1e-8)
+            
+            # Apply target statistics with blending
+            target_std = quality_tracker['std'] * (1 - strength) + current_std.item() * strength
+            target_mean = quality_tracker['mean'] * (1 - strength) + current_mean.item() * strength
+            
+            latent = normalized * target_std + target_mean
+        
+        return latent
+
+    def _preserve_frame_quality(self, frame, quality_tracker):
+        """Final quality check for individual frames."""
+        # Check for extreme values
+        if (frame > 4.0).any() or (frame < -4.0).any():
+            frame = torch.clamp(frame, -3.5, 3.5)
+        
+        # Check distribution
+        frame_std = frame.std()
+        if frame_std < 0.1 or frame_std > 3.0:
+            frame = (frame - frame.mean()) / (frame_std + 1e-8)
+            frame = frame * quality_tracker['std'] + quality_tracker['mean']
+        
+        return frame
