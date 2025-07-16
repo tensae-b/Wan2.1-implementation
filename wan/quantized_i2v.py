@@ -509,8 +509,7 @@ class WanI2V:
         total_frames = 42
         
         
-        # Fixed context window size (e.g., 12 frames of context + 9 frames to generate)
-        # This matches the official code's multi-scale context: 1 + 2 + 16 ≈ 12 effective context frames
+      
         context_window_size = 12
         generation_window_size = 9
         total_sections = math.ceil(total_frames / latent_window_size)
@@ -609,30 +608,14 @@ class WanI2V:
                 else:
                     frame_offset = 20 + (section_idx - 1) * 20 # Correct offset calculation
     
-                    # Key optimization: Sliding window with overlap
-                    # We generate 9 new frames but use 3 overlap frames from previous
+                   
                     overlap_frames = 3
                     new_frames_to_generate = 20
                     context_window_size = 12
-                    
-                    # Get context using the optimized strategy
-                    context_frames = self._get_optimized_context_window(
-                        all_generated_frames, 
-                        1, 
-                        overlap_frames,
-                        lat_h, 
-                        lat_w
-                    )
-                    
-                    
-                    
+               
                     img_context = TF.to_tensor(context_frame_decoded[0]).sub_(0.5).div_(0.5).to(self.device)
                     print('context frames', img_context.shape,'none', img_context[None].shape)
-                    # context_frames = context_frames.to('cuda:2')
-                    # decoded= self.vae.decode(context_frames)
-                    # frame = decoded[0].squeeze(1)
-                    # print('decoded frames', frame.shape)
-                    # frame = frame.clamp(0, 1)  # in case values are outside the valid range
+                    
 
                     h_context, w_context = img_context.shape[1:]
                     img_context=img_context.to('cuda:2')
@@ -646,27 +629,6 @@ class WanI2V:
               dim=1).to('cuda:2')
          ])[0]
         
-                    # images = [TF.to_tensor(context_frame_decoded[i]).sub_(0.5).div_(0.5).to(self.device) 
-                    # for i in range(12)]
-                    # h_context, w_context=images[0].shape[1:]
-                    # img_batch = torch.stack(images, dim=0)  # [12, 3, 720, 544]
-                   
-                    # # Rest of the code remains the same
-                    # interpolated_batch = torch.nn.functional.interpolate(
-                    #     img_batch, size=(h_context, w_context), mode='bicubic'
-                    # ).transpose(0, 1)  # [3, 12, h_context, w_context]
-                    # img_batch=img_batch.to('cuda:2')
-                    # print('interpolated_batch shape', interpolated_batch.shape)
-                    # context_y =self.vae.encode([
-                    #         torch.concat([
-                    #             torch.nn.functional.interpolate(
-                    #     img_batch, size=(h_context, w_context), mode='bicubic'
-                    # ).transpose(0, 1) ,
-                    #             torch.zeros(3, 72, h_context, w_context, device='cuda:2')
-                    #         ],
-                    #         dim=1).to('cuda:2')
-                    #     ])[0]
-                    
                     
                     section_noise = torch.randn(
                         16, 21, lat_h, lat_w,
@@ -675,10 +637,9 @@ class WanI2V:
                         device=device
                     )
                     
-                    # Apply temporal coherence to initial noise
-                     # CRITICAL FIX 2: Apply noise correlation properly
+                  
                     if len(all_generated_frames) >= 3:
-                        # Use last 3 frames for motion continuity
+                       
                         last_frames = torch.cat(all_generated_frames[-3:], dim=1)
                         motion_delta = last_frames[:, -1] - last_frames[:, -2]
                         motion_delta=motion_delta.to('cuda:0')
@@ -694,17 +655,9 @@ class WanI2V:
                         device='cuda:2'  # Create directly on target device
                     )
                     
-                    # Move context frames directly to target device
                     
-                    
-                    # Concatenate on target device (avoiding extra memory copy)
-                    # latent_sequence = torch.cat([context_frames, zeros_for_generation], dim=1)
                     latent_sequence=context_y
-                    # msk_section = torch.ones(1, 84, lat_h, lat_w, device=self.device)  # 84 = (12+9) * 4
-                    # msk_section[:, 12*4:] = 0  # Set the last 36 elements (9 generation frames * 4) to 0
-                    # msk_section = msk_section.view(1, msk_section.shape[1] // 4, 4, lat_h, lat_w)
-                    # msk_section = msk_section.transpose(1, 2)[0]
-                    # msk_section = msk_section.to('cuda:2')
+                  
                     msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
                     msk[:, 1:] = 0
                     msk = torch.concat([
@@ -716,16 +669,7 @@ class WanI2V:
                     msk_section = msk_section.to('cuda:2')
                     print('msk_section shape', msk_section.shape)
                     print('latent_sequence shape', latent_sequence.shape)
-                    # # Create mask more efficiently
-                    # msk_section = self._create_generation_mask(
-                    #     context_window_size, 
-                    #     new_frames_to_generate, 
-                    #     lat_h, 
-                    #     lat_w, 
-                    #     device='cuda:2'
-                    # )
                     
-                    # Use only generation portion of noise
                     latent = section_noise
 
                 # Shared post-processing for both branches
@@ -756,15 +700,12 @@ class WanI2V:
                 
                 if offload_model:
                     torch.cuda.empty_cache()
-                # adaptive_guide_scale = guide_scale * (1.0 - section_idx * 0.1)  # Slightly reduce for later sections
-                # adaptive_guide_scale = max(adaptive_guide_scale, guide_scale * 0.7)
-                # Denoising loop - only denoise the generation window
+                
                 for step_idx, t in enumerate(tqdm(timesteps, desc=f"Section {section_idx + 1}")):
                     if step_idx % 5 == 0:
                         torch.cuda.empty_cache()
                     
-                    # Important: We need to pad latent to full window size for model input
-                    # Model expects shape [16, 21, lat_h, lat_w]
+                   
                     latent_padded = latent
                     print(latent_padded.shape,'shape')
                     # Denoise
@@ -782,14 +723,11 @@ class WanI2V:
                     
                     
                 if section_idx == 0:
-                    # First section: skip the first frame (context)
                     generated_frames = latent[:, 1:, :, :]  # 20 new frames
                 else:
-                    # Other sections: only last 9 frames are new
+                   
                     generated_frames = latent[:, -9:, :, :]  # 9 new frames
-                    # generated_frames = latent[:, 1:, :, :]
-                
-                # Update quality tracker
+                  
                 quality_tracker['mean'] = generated_frames.mean().item() * 0.1 + quality_tracker['mean'] * 0.9
                 quality_tracker['std'] = generated_frames.std().item() * 0.1 + quality_tracker['std'] * 0.9
                 
@@ -803,13 +741,7 @@ class WanI2V:
                     all_generated_frames.append(frame)
                 
                 all_generated_latents.append(generated_frames.cpu())
-                # Store generated frames
-                # for frame_idx in range(latent.shape[1]):
-                #     all_generated_frames.append(latent[:, frame_idx:frame_idx+1, :, :])
-                
-                # all_generated_latents.append(latent.cpu())
-                
-                # Cleanup
+              
                 del latent, section_noise
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -889,232 +821,7 @@ class WanI2V:
         
         return None
 
-    def _get_fixed_context_window(self, all_frames, context_size, lat_h, lat_w):
-        """
-        Optimal context window selection for long video generation.
-        Prioritizes temporal coherence and motion continuity.
-        """
-        device = self.device
-        context_size = 12
-        
-        if not all_frames:
-            return torch.zeros(16, context_size, lat_h, lat_w, device=device)
-        
-        total_available = len(all_frames)
-        
-        # For video generation, we want:
-        # 1. Most recent frames (for continuity)
-        # 2. Key frames at regular intervals (for long-term consistency)
-        # 3. Motion-aware selection (frames with significant changes)
-        
-        def compute_motion_score(frame1, frame2):
-            """Compute motion between two frames"""
-            if frame1.shape != frame2.shape:
-                return 0.0
-            motion = torch.abs(frame2 - frame1).mean().item()
-            return motion
-        
-        def get_frame_importance(idx, total_frames):
-            """
-            Calculate frame importance based on position.
-            Recent frames and keyframes get higher importance.
-            """
-            recency_weight = (idx / total_frames) ** 2  # More recent = higher weight
-            
-            # Keyframe weight (every 8th frame is important)
-            keyframe_weight = 1.0 if idx % 8 == 0 else 0.5
-            
-            return recency_weight * 0.7 + keyframe_weight * 0.3
-        
-        # Strategy 1: Short sequence (< 24 frames) - Use all or evenly sample
-        if total_available <= 24:
-            if total_available <= context_size:
-                # Use all available frames
-                selected_indices = list(range(total_available))
-                # Pad with repeated last frame if needed
-                while len(selected_indices) < context_size:
-                    selected_indices.append(total_available - 1)
-            else:
-                # Evenly sample with bias toward recent
-                step = total_available / context_size
-                selected_indices = []
-                for i in range(context_size):
-                    # Bias toward more recent frames
-                    idx = int(i * step * (1 + i / context_size * 0.3))
-                    idx = min(idx, total_available - 1)
-                    selected_indices.append(idx)
-        
-        # Strategy 2: Long sequence - Hierarchical sampling
-        else:
-            selected_indices = []
-            
-            # Phase 1: Always include most recent frames (50% of context)
-            recent_count = context_size // 2  # 6 frames
-            recent_start = max(0, total_available - recent_count)
-            selected_indices.extend(range(recent_start, total_available))
-            
-            # Phase 2: Key frames at exponential intervals (25% of context)
-            keyframe_count = context_size // 4  # 3 frames
-            if total_available > recent_count:
-                # Exponential spacing for historical frames
-                remaining_frames = total_available - recent_count
-                for i in range(keyframe_count):
-                    # Exponential decay: more samples from recent history
-                    t = (i + 1) / keyframe_count
-                    idx = int(remaining_frames * (1 - t**2))
-                    idx = max(0, min(idx, recent_start - 1))
-                    if idx not in selected_indices:
-                        selected_indices.append(idx)
-            
-            # Phase 3: Motion-based selection (25% of context)
-            motion_count = context_size - len(selected_indices)
-            if motion_count > 0 and total_available > 2:
-                # Compute motion scores
-                motion_scores = []
-                for i in range(1, min(total_available, recent_start)):
-                    if i not in selected_indices:
-                        motion = compute_motion_score(all_frames[i-1], all_frames[i])
-                        importance = get_frame_importance(i, total_available)
-                        combined_score = motion * 0.6 + importance * 0.4
-                        motion_scores.append((i, combined_score))
-                
-                # Select frames with highest motion scores
-                motion_scores.sort(key=lambda x: x[1], reverse=True)
-                for idx, _ in motion_scores[:motion_count]:
-                    selected_indices.append(idx)
-            
-            # Ensure we have exactly context_size frames
-            selected_indices = list(set(selected_indices))  # Remove duplicates
-            selected_indices.sort()  # Maintain temporal order
-            
-            # Pad if necessary
-            while len(selected_indices) < context_size:
-                # Add most recent frame
-                selected_indices.append(total_available - 1)
-        
-        # Extract selected frames
-        context_frames = []
-        for idx in selected_indices[:context_size]:
-            frame = all_frames[idx]
-            
-            # Ensure correct shape
-            if frame.dim() == 3:  # [16, lat_h, lat_w]
-                frame = frame.unsqueeze(1)  # [16, 1, lat_h, lat_w]
-            
-            context_frames.append(frame)
-        
-        # Apply lightweight stabilization (no heavy regularization)
-        context_frames = self._stabilize_context_frames(context_frames)
-        
-        # Stack frames
-        context_tensor = torch.cat(context_frames, dim=1)
-        
-        print(f"Selected indices: {selected_indices[:context_size]}")
-        print(f"Context shape: {context_tensor.shape}")
-        
-        return context_tensor.to(device)
-
-    def _stabilize_context_frames(self, frames):
-        """
-        Lightweight stabilization to prevent distribution shift.
-        Much gentler than the original regularization.
-        """
-        if not frames:
-            return frames
-        
-        # Compute global statistics
-        all_frames_cat = torch.cat(frames, dim=1)
-        global_mean = all_frames_cat.mean()
-        global_std = all_frames_cat.std()
-        
-        stabilized_frames = []
-        for frame in frames:
-            # Very gentle normalization only if distribution is extreme
-            frame_std = frame.std()
-            frame_mean = frame.mean()
-            
-            if frame_std < 0.1 or frame_std > 3.0:
-                # Only fix extreme cases
-                frame = (frame - frame_mean) / (frame_std + 1e-8)
-                frame = frame * global_std + global_mean
-            elif abs(frame_mean) > 2.0:
-                # Only shift if mean is too far off
-                frame = frame - frame_mean + global_mean
-            
-            stabilized_frames.append(frame)
-        
-        return stabilized_frames
-
-    # Alternative: Sliding Window Approach for Very Long Videos
-    def _get_sliding_window_context(self, all_frames, context_size, current_position, lat_h, lat_w):
-        """
-        Sliding window approach for extremely long video generation.
-        Maintains local coherence while preserving long-term structure.
-        """
-        device = self.device
-        total_frames = len(all_frames)
-        
-        if not all_frames:
-            return torch.zeros(16, context_size, lat_h, lat_w, device=device)
-        
-        # Window composition:
-        # - 70% recent frames (local context)
-        # - 20% medium-range frames  
-        # - 10% long-range anchors
-        
-        recent_size = int(context_size * 0.7)  # 8-9 frames
-        medium_size = int(context_size * 0.2)  # 2-3 frames
-        anchor_size = context_size - recent_size - medium_size  # 1-2 frames
-        
-        selected_indices = []
-        
-        # Recent window
-        recent_start = max(0, current_position - recent_size)
-        recent_end = current_position
-        selected_indices.extend(range(recent_start, recent_end))
-        
-        # Medium-range sampling
-        if recent_start > 0:
-            medium_start = max(0, recent_start - recent_size * 3)
-            medium_candidates = list(range(medium_start, recent_start))
-            if len(medium_candidates) > medium_size:
-                # Sample evenly
-                step = len(medium_candidates) / medium_size
-                for i in range(medium_size):
-                    idx = medium_start + int(i * step)
-                    selected_indices.append(idx)
-            else:
-                selected_indices.extend(medium_candidates)
-        
-        # Long-range anchors (beginning and key points)
-        if current_position > context_size * 2:
-            # Always include first frame as anchor
-            selected_indices.append(0)
-            
-            # Add checkpoint frames at regular intervals
-            checkpoint_interval = total_frames // 8
-            for i in range(1, anchor_size):
-                checkpoint_idx = i * checkpoint_interval
-                if checkpoint_idx < medium_start:
-                    selected_indices.append(checkpoint_idx)
-        
-        # Ensure we have the right number of frames
-        selected_indices = sorted(list(set(selected_indices)))[:context_size]
-        
-        # Pad if necessary
-        while len(selected_indices) < context_size:
-            selected_indices.append(max(0, current_position - 1))
-        
-        # Extract and process frames
-        context_frames = []
-        for idx in selected_indices:
-            frame = all_frames[idx]
-            if frame.dim() == 3:
-                frame = frame.unsqueeze(1)
-            context_frames.append(frame)
-        
-        return torch.cat(context_frames, dim=1).to(device)
-
+   
     def _denoise_step_consistent(self, latent, t, arg_c, arg_null, guide_scale, scheduler, seed_g, step_idx, total_steps):
         """Denoise step for consistent y_section approach."""
         device = 'cuda:0'
@@ -1219,117 +926,7 @@ class WanI2V:
                 args_gpu[key] = value
         return args_gpu
     
-    def generate_correlated_noise(self, base_noise, correlation_strength=0.7):
-        
-        """
-        Generate noise that's correlated with previous section's final frames.
-        """
-        # Create fresh noise
-        fresh_noise = torch.randn_like(base_noise)
-        
-        # Blend with base noise for correlation
-        correlated_noise = correlation_strength * base_noise + \
-                        (1 - correlation_strength) * fresh_noise
-        
-        # Renormalize to maintain variance
-        correlated_noise = correlated_noise / correlated_noise.std() * fresh_noise.std()
-        
-        return correlated_noise
     
-    def _get_optimized_context_window(self, all_frames, context_size, overlap_frames, lat_h, lat_w):
-        """
-        Optimized context selection focusing on recent frames and motion continuity.
-        """
-        if not all_frames:
-            return torch.zeros(16, context_size, lat_h, lat_w, device=self.device)
-        
-        total_available = len(all_frames)
-        selected_frames = []
-        
-        # Strategy: 70% recent, 30% keyframes
-        recent_count = int(context_size * 0.7)
-        keyframe_count = context_size - recent_count
-        
-        # Always include the most recent frames
-        recent_start = max(0, total_available - recent_count)
-        for i in range(recent_start, total_available):
-            frame = all_frames[i]
-            if frame.dim() == 3:
-                frame = frame.unsqueeze(1)
-            selected_frames.append(frame)
-        
-        # Add keyframes from earlier in sequence
-        if recent_start > 0 and keyframe_count > 0:
-            # Exponential spacing for historical frames
-            for i in range(keyframe_count):
-                t = i / max(1, keyframe_count - 1)
-                idx = int(recent_start * (1 - t**2))
-                idx = max(0, min(idx, recent_start - 1))
-                
-                frame = all_frames[idx]
-                if frame.dim() == 3:
-                    frame = frame.unsqueeze(1)
-                selected_frames.append(frame)
-        
-        # Ensure we have exactly context_size frames
-        selected_frames = selected_frames[:context_size]
-        while len(selected_frames) < context_size:
-            # Pad with last frame
-            selected_frames.append(selected_frames[-1].clone())
-        
-        # Stack efficiently
-        return torch.cat(selected_frames, dim=1)
-
-    def _create_generation_mask(self, context_frames, gen_frames, lat_h, lat_w, device):
-        """Create generation mask directly on target device."""
-        total_frames = context_frames + gen_frames
-        
-        # Create mask directly on target device
-        msk = torch.ones(1, total_frames * 4, lat_h, lat_w, device=device)
-        msk[:, context_frames * 4:] = 0
-        
-        # Reshape in place
-        msk = msk.view(1, total_frames, 4, lat_h, lat_w)
-        return msk.transpose(1, 2)[0]
-
-    def _estimate_motion_direction(self, recent_frames, device):
-        """Estimate motion direction from recent frames for coherent noise init."""
-        if len(recent_frames) < 2:
-            return torch.zeros_like(recent_frames[-1])
-        
-        # Simple motion estimation
-        motion_accum = torch.zeros_like(recent_frames[-1])
-        
-        for i in range(1, len(recent_frames)):
-            frame_diff = recent_frames[i] - recent_frames[i-1]
-            # Weight more recent motion higher
-            weight = (i / len(recent_frames)) ** 2
-            motion_accum += frame_diff * weight
-        
-        # Normalize and return
-        motion_accum = motion_accum / (len(recent_frames) - 1)
-        return motion_accum.to(device)
-    def _preserve_latent_quality(self, latent, quality_tracker, strength=0.2):
-        """Preserve latent quality to prevent degradation."""
-        current_mean = latent.mean()
-        current_std = latent.std()
-        
-        # Only apply if distribution has drifted
-        mean_diff = abs(current_mean.item() - quality_tracker['mean'])
-        std_diff = abs(current_std.item() - quality_tracker['std'])
-        
-        if mean_diff > 0.5 or std_diff > 0.5:
-            # Normalize
-            normalized = (latent - current_mean) / (current_std + 1e-8)
-            
-            # Apply target statistics with blending
-            target_std = quality_tracker['std'] * (1 - strength) + current_std.item() * strength
-            target_mean = quality_tracker['mean'] * (1 - strength) + current_mean.item() * strength
-            
-            latent = normalized * target_std + target_mean
-        
-        return latent
-
     def _preserve_frame_quality(self, frame, quality_tracker):
         """Final quality check for individual frames."""
         # Check for extreme values
