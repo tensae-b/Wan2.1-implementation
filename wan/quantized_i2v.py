@@ -394,21 +394,136 @@ class WanI2V:
         torch.cuda.empty_cache()
         print("Model offloaded to CPU")
     
+    def select_context_frames(self, all_generated_frames, window_size=12):
+        """Select frames strategically like FramePack"""
+        if len(all_generated_frames) <= window_size:
+            return all_generated_frames
+        
+        total_frames = len(all_generated_frames)
+        selected_indices = []
+        print('total frames', total_frames)
+        
+        # 40% most recent frames
+        recent_count = int(window_size * 0.4)
+        selected_indices.extend(range(total_frames - recent_count, total_frames))
+        
+        # 40% exponentially spaced historical frames
+        historical_count = int(window_size * 0.4)
+        for i in range(historical_count):
+            t = i / max(1, historical_count - 1)
+            idx = int((total_frames - recent_count) * (1 - t**2))
+            selected_indices.append(idx)
+        
+        # 20% key frames at regular intervals
+        remaining = window_size - len(set(selected_indices))
+        if remaining > 0 and total_frames > 0:
+            interval = max(1, total_frames // remaining)
+            for i in range(remaining):
+                idx = min(i * interval, total_frames - 1)
+                selected_indices.append(idx)
+        
+        # Remove duplicates and sort
+        selected_indices = sorted(set(selected_indices))[:window_size]
+        
+        # Extract selected frames
+        selected_frames = [all_generated_frames[i] for i in selected_indices]
+        print('selected_frames', selected_frames[0].shape)
+        return selected_frames
+
+    def soft_blend_frames(self, new_frames, existing_frames, overlap_size=3):
+        """Blend overlapping frames instead of hard cut"""
+        if not existing_frames or overlap_size == 0:
+            return new_frames
+        
+        device = new_frames[0].device if isinstance(new_frames[0], torch.Tensor) else 'cuda:0'
+        
+        # Convert to tensors if needed
+        if not isinstance(new_frames[0], torch.Tensor):
+            new_frames = [torch.tensor(f, device=device) for f in new_frames]
+        if not isinstance(existing_frames[0], torch.Tensor):
+            existing_frames = [torch.tensor(f, device=device) for f in existing_frames]
+        
+        # Create blending weights
+        blend_weights = torch.linspace(0, 1, overlap_size, device=device)
+        
+        # Get overlap regions
+        overlap_existing = existing_frames[-overlap_size:]
+        overlap_new = new_frames[:overlap_size]
+        
+        # Blend
+        blended = []
+        for i in range(overlap_size):
+            weight = blend_weights[i]
+            blended_frame = overlap_existing[i] * (1 - weight) + overlap_new[i] * weight
+            blended.append(blended_frame)
+        
+        # Return: existing[:-overlap] + blended + new[overlap:]
+        result = existing_frames[:-overlap_size] + blended + new_frames[overlap_size:]
+        
+        return result
+
+    def initialize_noise_with_momentum(self, all_frames, shape, strength=0.3, device='cuda:0'):
+        """Initialize noise with temporal momentum"""
+        fresh_noise = torch.randn(shape, dtype=torch.float32, device=device)
+        
+        if len(all_frames) >= 3:
+            # Get last 3 frames as tensors
+            recent_frames = []
+            for f in all_frames[-3:]:
+                if isinstance(f, torch.Tensor):
+                    recent_frames.append(f.to(device))
+                else:
+                    recent_frames.append(torch.tensor(f, device=device))
+            
+            recent_frames = torch.cat(recent_frames, dim=1)
+            
+            # Estimate motion across multiple frames
+            motion_1 = recent_frames[:, -1] - recent_frames[:, -2]
+            motion_2 = recent_frames[:, -2] - recent_frames[:, -3]
+            
+            # Average motion with decay
+            avg_motion = (motion_1 + 0.5 * motion_2) / 1.5
+            
+            # Apply motion bias to noise (gradually decreasing)
+            for i in range(min(9, shape[1])):
+                alpha = (9 - i) / 9 * strength
+                fresh_noise[:, i] += avg_motion.mean(dim=[1, 2], keepdim=True) * alpha
+        
+        return fresh_noise
+
+    def get_adaptive_params(self, padding_idx, total_sections):
+        """Adjust parameters based on position in backward generation"""
+        # More overlap for sections generated first (video end)
+        if padding_idx < total_sections // 3:
+            overlap = 6  # More overlap at the "end"
+            cfg_scale = 6.5
+        elif padding_idx < 2 * total_sections // 3:
+            overlap = 3  # Medium overlap
+            cfg_scale = 6.5 * 0.9  # Slightly reduce
+        else:
+            overlap = 2  # Less overlap at the "beginning"
+            cfg_scale = 6.5 * 0.95
+        
+        return overlap, cfg_scale
+
     def generate(self,
                  input_prompt,
                  img,
-                 max_area=120 * 208,  # Reduced from 480 * 832
-                 frame_num=5,  # Reduced from 4  
-                 shift=5.0,  # Reduced from 5.0 for smaller resolution
+                 max_area=120 * 208,
+                 frame_num=5,
+                 shift=5.0,
                  sample_solver='unipc',
-                 sampling_steps=20,  # Reduced from 40
+                 sampling_steps=25,
                  guide_scale=6.5,
                  n_prompt="blurry, unclear",
                  seed=-1,
-                 offload_model=True):
-       
+                 offload_model=True,
+                 total_frames=29):
+        
+        # Image preprocessing
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
+        # Calculate dimensions
         F = frame_num
         h, w = img.shape[1:]
         aspect_ratio = h / w
@@ -425,27 +540,26 @@ class WanI2V:
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
+        # Seed setup
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
-        
 
+        # Create mask
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
+        ], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        print('text encoding')
-        # preprocess
-        text_encoder_device = torch.device('cuda:2')
-        text_device= torch.device('cuda:0')
+        print('Text encoding...')
+        # Text encoding
+        text_device = torch.device('cuda:0')
         
         if not self.t5_cpu:
             self.text_encoder.model.to(text_device)
@@ -460,10 +574,11 @@ class WanI2V:
             context_null = [t.to(text_device) for t in context_null]
         
         self.text_encoder.model.to('cpu')
-        print('text encoding done')
+        print('Text encoding done')
         torch.cuda.empty_cache()
         gc.collect()
-       
+
+        # CLIP encoding
         torch.cuda.synchronize()
         self.clip.model.to('cuda:2')
         img = img.to('cuda:2')
@@ -472,87 +587,81 @@ class WanI2V:
         torch.cuda.empty_cache()
         gc.collect()
 
-        torch.cuda.synchronize()
-        
-        
-        print('image shape', img.shape, 'none',img[None].shape , 'F', F)
+        # VAE encoding for start frame
+        print('VAE encoding...')
         y = self.vae.encode([
-             torch.concat([
-                 torch.nn.functional.interpolate(
-          img[None], size=(h, w), mode='bicubic').transpose(
-              0, 1),
-                 torch.zeros(3, F - 1, h, w, device='cuda:2')
-             ],
-              dim=1).to('cuda:2')
-         ])[0]
+            torch.concat([
+                torch.nn.functional.interpolate(
+                    img[None], size=(h, w), mode='bicubic').transpose(0, 1),
+                torch.zeros(3, F - 1, h, w, device='cuda:2')
+            ], dim=1).to('cuda:2')
+        ])[0]
         
-        msk = msk.to(text_encoder_device)
+        msk = msk.to('cuda:2')
         ys = torch.concat([msk, y])
-        print('msk concat', msk.shape)
-        print('ys concat', ys.shape)
-        img=img.to("cpu")
+        img = img.to("cpu")
         torch.cuda.empty_cache()
         gc.collect()
 
-        torch.cuda.synchronize()
+        # FramePack setup
+        latent_window_size = 21
+        generation_window_size = 9
+        context_window_size = 12
         
+        # Calculate sections with FramePack's inverted padding schedule
+        total_sections = math.ceil((total_frames-20) / generation_window_size)+1
         
-     
+        # FramePack's inverted padding schedule for backward generation
+        if total_sections <= 4:
+            latent_paddings = list(reversed(range(total_sections)))
+        else:
+            latent_paddings = [3] + [2] * (total_sections - 3) + [1, 0]
+        
+        print(f"Generating {total_frames} frames in {total_sections} sections (backward order)")
+        print(f"Padding schedule: {latent_paddings}")
+        
+        # Store the start latent
+        start_latent = y
+        
+        # Storage for generated content
+        all_generated_frames = []
+        all_generated_sections = []  # Store sections for final reversal
+        context_frame_decoded = []
+        history_latents = []  # Memory-efficient history
+        max_history = 100
+        
+        # Quality tracking
+        quality_tracker = {
+            'mean': start_latent.mean().item(),
+            'std': start_latent.std().item(),
+            'initialized': True
+        }
+        
+        # No sync context
         @contextmanager
         def noop_no_sync():
             yield
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-        sampling_steps = 20
-        sample_solver = 'dpm++'
-        # Calculate total frames and sections
-        latent_window_size = 21
-        total_frames = 42
-        
-        
-      
-        context_window_size = 12
-        generation_window_size = 9
-        total_sections = math.ceil(total_frames / latent_window_size)
-        # Ensure it adds up to latent_window_size
-        
-        
-        print(f"Generating {total_frames} frames in {total_sections} sections")
-        print(f"Using fixed context window: {context_window_size} frames, generating: {generation_window_size} frames per section")
-        
-        # Store the start latent
-        start_latent = y  # Shape: (16, lat_h, lat_w)
-        
-        
-        all_generated_latents = []
-        all_generated_frames = []  # Flattened list of all frames for easy access
-        context_frame_decoded=[]
-        device = self.device
-        dtype = self.param_dtype
         
         # Random generator
-        rng = torch.Generator(device=device)
+        rng = torch.Generator(device=self.device)
         if hasattr(seed_g, 'initial_seed'):
             rng.manual_seed(seed_g.initial_seed())
         else:
             rng.manual_seed(42)
-        
-        
-                
 
-                # Initialize scheduler
-        quality_tracker = {
-            'mean': 0.0,
-            'std': 1.0,
-            'initialized': False
-        }
-        
-
+        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+            for padding_idx, latent_padding in enumerate(latent_paddings):
+                is_first_backward = (padding_idx == 0)
+                is_last_backward = (latent_padding == 0)
                 
-        with amp.autocast(dtype=dtype), torch.no_grad(), no_sync():
-            for section_idx in range(total_sections):
-                print(f'\nSection {section_idx + 1}/{total_sections}')
+                print(f'\nBackward section {padding_idx + 1}/{total_sections} (padding={latent_padding})')
                 
-                # Generate fresh noise for generation window only
+                # Get adaptive parameters
+                overlap_frames, cfg_scale = self.get_adaptive_params(padding_idx, total_sections)
+                sampling_steps=40
+                
+                # Initialize scheduler for this section
                 if sample_solver == 'unipc':
                     sample_scheduler = FlowUniPCMultistepScheduler(
                         num_train_timesteps=self.num_train_timesteps,
@@ -573,111 +682,85 @@ class WanI2V:
                         sigmas=sampling_sigmas)
                 else:
                     raise NotImplementedError("Unsupported solver.")
-               
-                    
-                if section_idx == 0:
-                    frame_offset = 0
-                    section_noise = torch.randn(
-                    16, 21, lat_h, lat_w,
-                    dtype=torch.float32,
-                    generator=rng,
-                    device=device
-                )
-                    print(section_noise.shape,'section_noise section1, shape')
-                    latent_sequence = start_latent
-                    print(latent_sequence.shape,'latent_sequence section 1, shape')
-                    
-                    # Create mask: 1 for context, 0 for generation
-                    msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
-                    msk[:, 1:] = 0
-                    msk = torch.concat([
-                        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-                    ],
-                                    dim=1)
-                    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-                    msk_section = msk.transpose(1, 2)[0]
-                    print(msk_section.shape,'msk_section, shape')
-                    # Initial latent is pure noise for generation window
-                    latent = section_noise
-                    msk_section=msk_section.to('cuda:2')
-                    latent_sequence=latent_sequence.to('cuda:2')
-                    quality_tracker['mean'] = start_latent.mean().item()
-                    quality_tracker['std'] = start_latent.std().item()
-                    quality_tracker['initialized'] = True
-                    
-                else:
-                    frame_offset = 20 + (section_idx - 1) * 20 # Correct offset calculation
-    
-                   
-                    overlap_frames = 3
-                    new_frames_to_generate = 20
-                    context_window_size = 12
-               
-                    img_context = TF.to_tensor(context_frame_decoded[0]).sub_(0.5).div_(0.5).to(self.device)
-                    print('context frames', img_context.shape,'none', img_context[None].shape)
-                    
-
-                    h_context, w_context = img_context.shape[1:]
-                    img_context=img_context.to('cuda:2')
-                    context_y =self.vae.encode([
-             torch.concat([
-                 torch.nn.functional.interpolate(
-          img_context[None], size=(h_context, w_context), mode='bicubic').transpose(
-              0, 1),
-                 torch.zeros(3, F - 1, h_context, w_context, device='cuda:2')
-             ],
-              dim=1).to('cuda:2')
-         ])[0]
-        
-                    
+                
+                if is_first_backward:
+                    # First section in backward generation (end of video)
+                    frame_offset = (total_sections - 1) * generation_window_size
                     section_noise = torch.randn(
                         16, 21, lat_h, lat_w,
                         dtype=torch.float32,
                         generator=rng,
-                        device=device
+                        device=self.device
                     )
+                    latent_sequence = start_latent
+                    msk_section = msk
+                else:
+                    # Calculate frame offset for backward generation
+                    frame_offset = latent_padding * generation_window_size
                     
-                  
-                    if len(all_generated_frames) >= 3:
-                       
-                        last_frames = torch.cat(all_generated_frames[-3:], dim=1)
-                        motion_delta = last_frames[:, -1] - last_frames[:, -2]
-                        motion_delta=motion_delta.to('cuda:0')
+                    # Select context frames intelligently
+                    if len(context_frame_decoded) > 0 :
+                        # Use the last decoded frame as context
+                        img_context = TF.to_tensor(context_frame_decoded[-1]).sub_(0.5).div_(0.5).to(self.device)
+                        h_context, w_context = img_context.shape[1:]
+                        img_context = img_context.to('cuda:2')
                         
-                        # Apply motion to noise for continuity
-                        for i in range(3):
-                            alpha = (3 - i) / 3  # Decreasing influence
-                            section_noise[:, -9 + i] += motion_delta * alpha * 0.15
+                        context_y = self.vae.encode([
+                            torch.concat([
+                                torch.nn.functional.interpolate(
+                                    img_context[None], size=(h_context, w_context), mode='bicubic').transpose(0, 1),
+                                torch.zeros(3, 80, h_context, w_context, device='cuda:2')
+                            ], dim=1).to('cuda:2')
+                        ])[0]
+                        
+                        latent_sequence = context_y
+                        print('context_y',context_y.shape)
+                    else:
+                        # Fallback to using generated frames
+                        selected_frames = self.select_context_frames(all_generated_frames, context_window_size)
+                        if selected_frames:
+                            latent_sequence = torch.cat(selected_frames, dim=1).to('cuda:2')
+                        else:
+                            latent_sequence = start_latent
+                            
+                        print('latent_sequence',latent_sequence.shape)
+                        current_len = latent_sequence.shape[1]
+                        if current_len < 21:
+                            pad_shape = list(latent_sequence.shape)
+                            pad_shape[1] = 21 - current_len  # How many to pad
+                            padding = torch.zeros(pad_shape, device=latent_sequence.device, dtype=latent_sequence.dtype)
+                            latent_sequence = torch.cat([latent_sequence, padding], dim=1)
+                            
+                        N = 21  # total number of latent tokens (or set dynamically)
+                        H, W = lat_h, lat_w
+                        num_total_tokens = 21 * 4  # = 84
+                        context_tokens = current_len * 4  # each timestep has 4 tokens
+                        msk_new = torch.zeros(1, num_total_tokens, lat_h, lat_w, device=self.device)
+                        msk_new[:, :context_tokens] = 1  # Mark context tokens
+                        msk_new = msk_new.view(1, num_total_tokens // 4, 4, lat_h, lat_w)
+                        msk_new = msk_new.transpose(1, 2)[0]
+                        msk_section=msk_new
+                        print('new msk shape:', msk_new.shape) 
                     
-                    # Create latent sequence efficiently
-                    zeros_for_generation = torch.zeros(
-                        16, new_frames_to_generate, lat_h, lat_w, 
-                        device='cuda:2'  # Create directly on target device
+                    # Initialize noise with momentum
+                    section_noise = self.initialize_noise_with_momentum(
+                        all_generated_frames,
+                        (16, 21, lat_h, lat_w),
+                        strength=0.3,
+                        device=self.device
                     )
                     
-                    
-                    latent_sequence=context_y
-                  
-                    msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
-                    msk[:, 1:] = 0
-                    msk = torch.concat([
-                        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-                    ],
-                                    dim=1)
-                    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-                    msk_section = msk.transpose(1, 2)[0]
-                    msk_section = msk_section.to('cuda:2')
-                    print('msk_section shape', msk_section.shape)
-                    print('latent_sequence shape', latent_sequence.shape)
-                    
-                    latent = section_noise
-
-                # Shared post-processing for both branches
+                    # Create mask
+                    msk_section = msk.to('cuda:2')
+                
+                # Prepare latent for denoising
+                latent = section_noise
+                
+                print('msk',msk_section.shape)
+                print('latent',latent_sequence.shape)
                 y_section = torch.cat([msk_section, latent_sequence], dim=0)
                 
-                
-                print(f'y_section shape: {y_section.shape} (consistent across all sections)')
-                print(f'latent shape: {latent.shape} (only generation window)')
+                print(f'Frame offset: {frame_offset}, Overlap: {overlap_frames}')
                 
                 # Prepare conditioning arguments
                 arg_c = {
@@ -696,141 +779,117 @@ class WanI2V:
                     'frame_offset': frame_offset
                 }
                 
-                
-                
                 if offload_model:
                     torch.cuda.empty_cache()
                 
-                for step_idx, t in enumerate(tqdm(timesteps, desc=f"Section {section_idx + 1}")):
+                # Denoising loop
+                for step_idx, t in enumerate(tqdm(timesteps, desc=f"Section {padding_idx + 1}")):
                     if step_idx % 5 == 0:
                         torch.cuda.empty_cache()
                     
-                   
-                    latent_padded = latent
-                    print(latent_padded.shape,'shape')
-                    # Denoise
-                    latent_padded = self._denoise_step_consistent(
-                        latent_padded, t, arg_c, arg_null, guide_scale,
+                    # Denoise with adjusted cfg_scale
+                    latent = self._denoise_step_consistent(
+                        latent, t, arg_c, arg_null, cfg_scale,
                         sample_scheduler, seed_g, step_idx, len(timesteps)
                     )
                     
-                    # Extract only the generation window
-                    latent = latent_padded
-                    
-                    # break
                     gc.collect()
-                    
-                    
-                    
-                if section_idx == 0:
-                    generated_frames = latent[:, 1:, :, :]  # 20 new frames
+                    #break
+                
+                # Extract generated frames
+                if is_first_backward:
+                    generated_frames = latent[:, 1:, :, :]  # Skip first frame
                 else:
-                   
-                    generated_frames = latent[:, -9:, :, :]  # 9 new frames
-                  
+                    generated_frames = latent[:, -generation_window_size:, :, :]
+                
+                # Update quality tracker
                 quality_tracker['mean'] = generated_frames.mean().item() * 0.1 + quality_tracker['mean'] * 0.9
                 quality_tracker['std'] = generated_frames.std().item() * 0.1 + quality_tracker['std'] * 0.9
                 
-                # Store frames with quality check
+                # Store frames with quality preservation
+                section_frames = []
                 for frame_idx in range(generated_frames.shape[1]):
                     frame = generated_frames[:, frame_idx:frame_idx+1, :, :]
-                    
-                    # Final quality preservation per frame
                     frame = self._preserve_frame_quality(frame, quality_tracker)
-                    
-                    all_generated_frames.append(frame)
+                    section_frames.append(frame)
                 
-                all_generated_latents.append(generated_frames.cpu())
-              
+                # Apply soft blending if not first section
+                if not is_first_backward and overlap_frames > 0 and all_generated_frames:
+                    section_frames = self.soft_blend_frames(
+                        section_frames,
+                        all_generated_frames[-overlap_frames:],
+                        overlap_frames
+                    )
+                
+                # Update storage
+                all_generated_frames.extend(section_frames)
+                all_generated_sections.append(section_frames)
+                
+                # Memory management
+                history_latents.append(generated_frames.cpu())
+                if len(history_latents) > max_history:
+                    history_latents.pop(0)
+                
+                # Cleanup
                 del latent, section_noise
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 gc.collect()
                 
-                
-                print(f"Section {section_idx + 1} complete. Generated {generation_window_size} new frames")
+                print(f"Section {padding_idx + 1} complete. Generated {len(section_frames)} new frames")
                 print(f"Total frames generated so far: {len(all_generated_frames)}")
-               
-                all_generated_framess = torch.cat(all_generated_frames, dim=1)
-                all_generated_framess=all_generated_framess.to('cuda:2')
-                print(f"all_generated_framess: {all_generated_framess.shape}")
-                videos = self.vae.decode([all_generated_framess])
-               
-               
-                videos = videos[0]  # If it's [1, N, C, H, W], take the first sample
-                # videos = videos.unsqueeze(1)         # [T, 1, H, W]
-                # videos = videos.repeat(1, 3, 1, 1) 
-                print(videos.shape,'vidoes shape')
-                def cache_video_and_get_last_frame(tensor, save_file=None, fps=24, save_image=None, suffix='.mp4',
-                                   nrow=8, normalize=True, value_range=(-1, 1), retry=3):
-                    """
-                    Cache video tensor to file and return the last frame as numpy array.
-                    
-                    Uses the same processing logic as the working cache_video function.
-                    
-                    Returns:
-                        tuple: (cache_file_path, last_frame_img) where last_frame_img is numpy array [H, W, C]
-                    """
-                    import random
-                    import string
-                    cache_file=''
-                    video_tensor = tensor.cpu().detach()  # move to CPU if not already
-                    if value_range == (-1, 1):
-                        video_tensor = (video_tensor + 1.0) / 2.0
-                    video_tensor = torch.clamp(video_tensor, 0.0, 1.0)  # Ensure values in [0, 1]
-
-                    # Convert to NumPy: [T, H, W, C]
-                    video_np = video_tensor.permute(1, 2, 3, 0).numpy()  # [77, 720, 544, 3]
-                    video_np_uint8 = (video_np * 255).astype(np.uint8)
-
-                    # Save MP4
-                    imageio.mimsave(save_file, video_np_uint8, fps=24)
-                    frames_12 = video_np_uint8[-12:] 
-                    for id,frame in enumerate(frames_12):
-                        context_frame_decoded.append(frame)
-                        Image.fromarray(frame).save(f"{save_image}{id}.png")
-
-                    # Extract and save last frame as PNG
-                    last_frame_img = video_np_uint8[-1]  # Shape [720, 544, 3]
-                    # Image.fromarray(last_frame_img).save(save_image)
-                    
-                    return cache_file, last_frame_img
-                    
-                    
-
-
-                filename=f"section-video-{section_idx}.mp4"
-                imagename=f"last-frame-{section_idx}-"
-                cache_path, last_frame_img =cache_video_and_get_last_frame(videos, save_file=filename, fps=24, save_image=imagename)
-                # context_frame_decoded.append(last_frame_img)
                 
+                # Periodic saving (only every 5 sections or last)
+                if  True:
+                    # Decode recent frames
+                    recent_frames = all_generated_frames[-min(50, len(all_generated_frames)):]
+                    recent_tensor = torch.cat(recent_frames, dim=1).to('cuda:2')
+                    
+                    videos = self.vae.decode([recent_tensor])
+                    videos = videos[0]
+                    
+                    # Cache video and get context frame
+                    filename = f"checkpoint_backward_{padding_idx}.mp4"
+                    imagename = f"context_frame_{padding_idx}_"
+                    cache_path, last_frame_img = self.cache_video_and_get_last_frame(
+                        videos, save_file=filename, fps=12, save_image=imagename
+                    )
+                    
+                    # Store context frame for next section
+                    context_frame_decoded = [last_frame_img]
+                    
+                    del videos, recent_tensor
+                    torch.cuda.empty_cache()
 
-        # Combine all generated frames
-        final_latent = self._combine_generated_frames(
-            all_generated_frames, start_latent, total_frames, device='cuda:2'
+        # Final assembly - REVERSE the backward generation
+        print("\nAssembling final video (reversing backward generation)...")
+        final_latent = self._combine_generated_frames_backward(
+            all_generated_sections, start_latent, total_frames, device='cuda:2'
         )
-        print(final_latent.shape,'final latent shape')
+        
+        print(f'Final latent shape: {final_latent.shape}')
         
         # Decode the final video
         if self.rank == 0:
             if offload_model:
                 self.offload_model_to_cpu()
             videos = self.vae.decode([final_latent])
-            print(videos[0].shape,'vidoes shape')
+            print(f'Final video shape: {videos[0].shape}')
             return videos[0]
         
         return None
 
-   
     def _denoise_step_consistent(self, latent, t, arg_c, arg_null, guide_scale, scheduler, seed_g, step_idx, total_steps):
-        """Denoise step for consistent y_section approach."""
+        """Denoise step with momentum for stability"""
         device = 'cuda:0'
-          # For quantized models, add momentum to stabilize
+        
+        # Momentum for quantized models
         if hasattr(self, '_prev_noise_pred') and self.use_quantized:
-            momentum = 0.3  # Smooth out predictions
+            momentum = 0.3
         else:
             momentum = 0.0
             self._prev_noise_pred = None
+        
         # Move to processing device
         latent_input = [latent.to(device)]
         timestep = torch.tensor([t]).to(device)
@@ -856,10 +915,13 @@ class WanI2V:
         
         # Apply classifier-free guidance
         noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+        
+        # Apply momentum if needed
         if self.use_quantized and self._prev_noise_pred is not None:
             noise_pred = momentum * self._prev_noise_pred + (1 - momentum) * noise_pred
-            
+        
         self._prev_noise_pred = noise_pred.clone()
+        
         # Scheduler step
         latent = latent.to('cpu')
         latent_next = scheduler.step(
@@ -872,50 +934,48 @@ class WanI2V:
         
         return latent_next
 
-    def _combine_generated_frames(self, all_frames, start_latent, total_frames, device):
-        """Combine all generated frames into final latent."""
-        # Handle start_latent with different dimensions
+    def _combine_generated_frames_backward(self, all_sections, start_latent, total_frames, device):
+        """Combine sections generated in backward order into final forward video"""
+        # Prepare start frame
         if start_latent.dim() == 5:
-            # Shape: [16, 1, 21, 90, 68] - extract first frame
-            start_frame = start_latent[:, 0, 0:1, :, :].to(device)  # Shape: [16, 1, 90, 68]
+            start_frame = start_latent[:, 0, 0:1, :, :].to(device)
         elif start_latent.dim() == 4:
-            # Shape: [16, 21, 90, 68] - take first frame
-            start_frame = start_latent[:, 0:1, :, :].to(device)  # Shape: [16, 1, 90, 68]
+            start_frame = start_latent[:, 0:1, :, :].to(device)
         else:
-            # Shape: [16, 90, 68] - add temporal dimension
-            start_frame = start_latent.unsqueeze(1).to(device)  # Shape: [16, 1, 90, 68]
+            start_frame = start_latent.unsqueeze(1).to(device)
         
-        # Stack all generated frames
-        if all_frames:
-            # Ensure all frames have consistent shape [16, 1, 90, 68]
-            frames_to_concat = [start_frame]
-            for f in all_frames[:total_frames-1]:
-                if f.dim() == 3:
-                    frames_to_concat.append(f.unsqueeze(1).to(device))
+        # IMPORTANT: Reverse the sections since we generated backward
+        all_sections_reversed = list(reversed(all_sections))
+        
+        # Flatten all frames from reversed sections
+        all_frames_forward = [start_frame]
+        for section in all_sections_reversed:
+            for frame in section:
+                if frame.dim() == 3:
+                    all_frames_forward.append(frame.unsqueeze(1).to(device))
                 else:
-                    frames_to_concat.append(f.to(device))
-            
-            final_latent = torch.cat(frames_to_concat, dim=1)
-        else:
-            final_latent = start_frame
+                    all_frames_forward.append(frame.to(device))
         
-        # Ensure we have exactly the target number of frames
+        # Concatenate up to target frame count
+        final_latent = torch.cat(all_frames_forward[:total_frames], dim=1)
+        
+        # Ensure exact frame count
         if final_latent.shape[1] > total_frames:
             final_latent = final_latent[:, :total_frames, :, :]
         elif final_latent.shape[1] < total_frames:
             # Pad with zeros if needed
             padding = torch.zeros(
-                16, total_frames - final_latent.shape[1], 
+                16, total_frames - final_latent.shape[1],
                 final_latent.shape[2], final_latent.shape[3],
                 device=device
             )
             final_latent = torch.cat([final_latent, padding], dim=1)
         
-        print(f"Final latent shape: {final_latent.shape}")
+        print(f"Final latent shape after reversal: {final_latent.shape}")
         return final_latent
 
     def _move_args_to_device(self, args, device):
-        """Helper to move arguments to device."""
+        """Helper to move arguments to device"""
         args_gpu = {}
         for key, value in args.items():
             if isinstance(value, torch.Tensor):
@@ -925,10 +985,9 @@ class WanI2V:
             else:
                 args_gpu[key] = value
         return args_gpu
-    
-    
+
     def _preserve_frame_quality(self, frame, quality_tracker):
-        """Final quality check for individual frames."""
+        """Final quality check for individual frames"""
         # Check for extreme values
         if (frame > 4.0).any() or (frame < -4.0).any():
             frame = torch.clamp(frame, -3.5, 3.5)
@@ -940,5 +999,31 @@ class WanI2V:
             frame = frame * quality_tracker['std'] + quality_tracker['mean']
         
         return frame
-    
-    
+
+    def cache_video_and_get_last_frame(self, tensor, save_file=None, fps=24, save_image=None):
+        """Cache video tensor to file and return the last frame as numpy array"""
+        video_tensor = tensor.cpu().detach()
+        
+        # Normalize from [-1, 1] to [0, 1]
+        video_tensor = (video_tensor + 1.0) / 2.0
+        video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
+        
+        # Convert to NumPy: [T, H, W, C]
+        video_np = video_tensor.permute(1, 2, 3, 0).numpy()
+        video_np_uint8 = (video_np * 255).astype(np.uint8)
+        
+        # Save MP4
+        imageio.mimsave(save_file, video_np_uint8, fps=fps)
+        
+        # Extract last frame
+        last_frame_img = video_np_uint8[-1]
+        
+        if save_image:
+            Image.fromarray(last_frame_img).save(f"{save_image}.png")
+        
+        return save_file, last_frame_img
+
+    def offload_model_to_cpu(self):
+        """Offload model to CPU to save GPU memory"""
+        self.model.cpu()
+        torch.cuda.empty_cache()
