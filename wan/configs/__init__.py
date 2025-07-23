@@ -7,6 +7,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 from .wan_i2v_14B import i2v_14B
 from .wan_t2v_1_3B import t2v_1_3B
 from .wan_t2v_14B import t2v_14B
+# from .wanFramepack import wan_framepack_vace
 
 # the config of t2i_14B is the same as t2v_14B
 t2i_14B = copy.deepcopy(t2v_14B)
@@ -25,6 +26,7 @@ WAN_CONFIGS = {
     'flf2v-14B': flf2v_14B,
     'vace-1.3B': t2v_1_3B,
     'vace-14B': t2v_14B,
+    'framepack': i2v_14B
 }
 
 SIZE_CONFIGS = {
@@ -49,5 +51,6 @@ SUPPORTED_SIZES = {
     'flf2v-14B': ('720*1280', '1280*720', '480*832', '832*480'),
     't2i-14B': tuple(SIZE_CONFIGS.keys()),
     'vace-1.3B': ('480*832', '832*480'),
-    'vace-14B': ('720*1280', '1280*720', '480*832', '832*480')
+    'vace-14B': ('720*1280', '1280*720', '480*832', '832*480'),
+    'framepack':('720*1280', '1280*720', '480*832', '832*480'),
 }

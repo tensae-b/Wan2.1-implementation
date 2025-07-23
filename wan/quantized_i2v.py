@@ -59,7 +59,7 @@ class WanI2V:
         # Determine if using quantized model
         self.use_quantized = quantized_model_dir is not None
         
-        block_num = 40
+        block_num = 3
         
         # Modified block_distributed_forward to use GPUs 1,2,3
         def block_distributed_forward(self, x, t=None, context=None, seq_len=None, clip_fea=None, y=None, **other_kwargs):
@@ -794,7 +794,7 @@ class WanI2V:
                     )
                     
                     gc.collect()
-                    #break
+                    break
                 
                 # Extract generated frames
                 if is_first_backward:
@@ -847,14 +847,14 @@ class WanI2V:
                     
                     videos = self.vae.decode([recent_tensor])
                     videos = videos[0]
-                    
+                   
                     # Cache video and get context frame
                     filename = f"checkpoint_backward_{padding_idx}.mp4"
                     imagename = f"context_frame_{padding_idx}_"
                     cache_path, last_frame_img = self.cache_video_and_get_last_frame(
                         videos, save_file=filename, fps=12, save_image=imagename
                     )
-                    
+                    context_frames= self.context_frame_picker(videos)
                     # Store context frame for next section
                     context_frame_decoded = [last_frame_img]
                     
@@ -1010,6 +1010,7 @@ class WanI2V:
         
         # Convert to NumPy: [T, H, W, C]
         video_np = video_tensor.permute(1, 2, 3, 0).numpy()
+        print('video_np', video_np.shape)
         video_np_uint8 = (video_np * 255).astype(np.uint8)
         
         # Save MP4
@@ -1027,3 +1028,6 @@ class WanI2V:
         """Offload model to CPU to save GPU memory"""
         self.model.cpu()
         torch.cuda.empty_cache()
+        
+    def context_frame_picker(self, videos):
+        print('videos', videos.shape)

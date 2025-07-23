@@ -58,6 +58,12 @@ EXAMPLE_PROMPT = {
             'examples/girl.png,examples/snake.png',
         "prompt":
             "在一个欢乐而充满节日气氛的场景中，穿着鲜艳红色春服的小女孩正与她的可爱卡通蛇嬉戏。她的春服上绣着金色吉祥图案，散发着喜庆的气息，脸上洋溢着灿烂的笑容。蛇身呈现出亮眼的绿色，形状圆润，宽大的眼睛让它显得既友善又幽默。小女孩欢快地用手轻轻抚摸着蛇的头部，共同享受着这温馨的时刻。周围五彩斑斓的灯笼和彩带装饰着环境，阳光透过洒在她们身上，营造出一个充满友爱与幸福的新年氛围。"
+    },
+    'framepack':{
+        "image":
+            'boy.png',
+        "prompt":
+            "blurry , dark"
     }
 }
 
@@ -557,6 +563,67 @@ def generate(args):
             src_mask,
             src_ref_images,
             size=SIZE_CONFIGS[args.size],
+            frame_num=args.frame_num,
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sample_steps,
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model)
+        
+    elif "framepack" in args.task:
+        print('here')
+        if args.prompt is None:
+            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
+        if args.image is None:
+            args.image = EXAMPLE_PROMPT[args.task]["image"]
+        logging.info(f"Input prompt: {args.prompt}")
+        logging.info(f"Input image: {args.image}")
+
+        img = Image.open(args.image).convert("RGB")
+        if args.use_prompt_extend:
+            logging.info("Extending prompt ...")
+            if rank == 0:
+                prompt_output = prompt_expander(
+                    args.prompt,
+                    tar_lang=args.prompt_extend_target_lang,
+                    image=img,
+                    seed=args.base_seed)
+                if prompt_output.status == False:
+                    logging.info(
+                        f"Extending prompt failed: {prompt_output.message}")
+                    logging.info("Falling back to original prompt.")
+                    input_prompt = args.prompt
+                else:
+                    input_prompt = prompt_output.prompt
+                input_prompt = [input_prompt]
+            else:
+                input_prompt = [None]
+            if dist.is_initialized():
+                dist.broadcast_object_list(input_prompt, src=0)
+            args.prompt = input_prompt[0]
+            logging.info(f"Extended prompt: {args.prompt}")
+
+        logging.info("Creating VACE Framepack pipeline.")
+        
+        
+        wan_framepack = wan.WanFramepack(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            quantized_model_dir='/home/comfy/projects/framepack-wan/Wan2.1/wan2.1-vace/',
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp,
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+            t5_cpu=args.t5_cpu,
+        )
+
+        logging.info("Generating video ...")
+        video = wan_framepack.generate(
+            args.prompt,
+            img,
+            max_area=MAX_AREA_CONFIGS[args.size],
             frame_num=args.frame_num,
             shift=args.sample_shift,
             sample_solver=args.sample_solver,
